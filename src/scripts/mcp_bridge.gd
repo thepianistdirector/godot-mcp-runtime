@@ -379,7 +379,7 @@ func _inject_mouse_button(action: Dictionary) -> String:
 		return button_result[1]
 	var button_index: MouseButton = button_result[0]
 
-	var pos = Vector2(action.get("x", 0), action.get("y", 0))
+	var pos := _viewport_to_window(Vector2(action.get("x", 0), action.get("y", 0)))
 	var double_click = action.get("double_click", false)
 
 	# If pressed is explicitly set, only do that one event
@@ -412,10 +412,28 @@ func _inject_mouse_button(action: Dictionary) -> String:
 
 func _inject_mouse_motion(action: Dictionary) -> void:
 	var event = InputEventMouseMotion.new()
-	event.position = Vector2(action.get("x", 0), action.get("y", 0))
+	event.position = _viewport_to_window(Vector2(action.get("x", 0), action.get("y", 0)))
 	event.global_position = event.position
-	event.relative = Vector2(action.get("relative_x", 0), action.get("relative_y", 0))
+	event.relative = _viewport_delta_to_window(Vector2(action.get("relative_x", 0), action.get("relative_y", 0)))
+	# A physical mouse reports held buttons in its motion events. Handlers that read button_mask,
+	# and Godot's own drag-and-drop, need the same from injected motion.
+	event.button_mask = Input.get_mouse_button_mask()
 	Input.parse_input_event(event)
+
+# Callers give positions in the root viewport's coordinates: the space get_ui_elements reports
+# and take_screenshot captures. Input.parse_input_event expects window coordinates, and under a
+# stretch mode the two differ (a 640x360 viewport in a 1280x720 window, letterboxed or not).
+# The root window's final transform maps viewport to window, letterbox offset included.
+func _viewport_to_window(pos: Vector2) -> Vector2:
+	return get_tree().root.get_final_transform() * pos
+
+func _viewport_delta_to_window(delta: Vector2) -> Vector2:
+	return get_tree().root.get_final_transform().basis_xform(delta)
+
+# A Control's rect in root-viewport coordinates, CanvasLayer transforms included.
+func _control_viewport_rect(ctrl: Control) -> Rect2:
+	var xform := ctrl.get_global_transform_with_canvas()
+	return Rect2(xform.origin, xform.basis_xform(ctrl.size))
 
 func _inject_action(action: Dictionary) -> String:
 	var action_name = action.get("action", "")
@@ -448,8 +466,7 @@ func _inject_click_element(action: Dictionary) -> String:
 		return button_result[1]
 	var button_index: MouseButton = button_result[0]
 	var double_click: bool = action.get("double_click", false)
-	var rect := target.get_global_rect()
-	var center := rect.get_center()
+	var center := _viewport_to_window(_control_viewport_rect(target).get_center())
 
 	var press := InputEventMouseButton.new()
 	press.button_index = button_index
@@ -488,7 +505,7 @@ func _collect_control_nodes(node: Node, elements: Array[Dictionary], visible_onl
 			for child in node.get_children():
 				_collect_control_nodes(child, elements, visible_only, type_filter)
 			return
-		var rect := ctrl.get_global_rect()
+		var rect := _control_viewport_rect(ctrl)
 		var element := {
 			"name": String(ctrl.name),
 			"type": ctrl.get_class(),

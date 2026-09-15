@@ -312,20 +312,20 @@ export const runtimeToolDefinitions = [
               x: {
                 type: 'number',
                 description:
-                  '[mouse_button, mouse_motion] X position in viewport pixels (0,0 = top-left)',
+                  '[mouse_button, mouse_motion] X position in viewport pixels (0,0 = top-left): the space of get_ui_elements rects and take_screenshot pixels. Converted to window pixels when a stretch mode scales or letterboxes the viewport.',
               },
               y: {
                 type: 'number',
                 description:
-                  '[mouse_button, mouse_motion] Y position in viewport pixels (0,0 = top-left)',
+                  '[mouse_button, mouse_motion] Y position in viewport pixels (0,0 = top-left): the space of get_ui_elements rects and take_screenshot pixels. Converted to window pixels when a stretch mode scales or letterboxes the viewport.',
               },
               relative_x: {
                 type: 'number',
-                description: '[mouse_motion] Relative X movement in pixels',
+                description: '[mouse_motion] Relative X movement in viewport pixels',
               },
               relative_y: {
                 type: 'number',
-                description: '[mouse_motion] Relative Y movement in pixels',
+                description: '[mouse_motion] Relative Y movement in viewport pixels',
               },
               double_click: {
                 type: 'boolean',
