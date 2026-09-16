@@ -36,6 +36,10 @@ var tcp_server: TCPServer
 var session_token: String = ""
 var _peers: Array = []   # Array[PeerState]
 var _shutting_down: bool = false  # One-shot: set true in shutdown(); never reset (autoload is recreated on next session)
+# Mouse buttons this bridge has pressed and not yet released, as a MouseButtonMask. Injected events
+# carry it. Input.get_mouse_button_mask() cannot stand in: parse_input_event queues events, so within
+# one simulate_input batch it still reads the state from before the batch's press.
+var _injected_button_mask: int = 0
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
@@ -384,31 +388,27 @@ func _inject_mouse_button(action: Dictionary) -> String:
 
 	# If pressed is explicitly set, only do that one event
 	if action.has("pressed"):
-		var event = InputEventMouseButton.new()
-		event.button_index = button_index
-		event.pressed = action.get("pressed")
-		event.position = pos
-		event.global_position = pos
-		event.double_click = double_click
-		Input.parse_input_event(event)
+		_parse_mouse_button(button_index, action.get("pressed") == true, pos, double_click)
 	else:
 		# Auto press + release (click)
-		var press = InputEventMouseButton.new()
-		press.button_index = button_index
-		press.pressed = true
-		press.position = pos
-		press.global_position = pos
-		press.double_click = double_click
-		Input.parse_input_event(press)
-
-		var release = InputEventMouseButton.new()
-		release.button_index = button_index
-		release.pressed = false
-		release.position = pos
-		release.global_position = pos
-		Input.parse_input_event(release)
+		_parse_mouse_button(button_index, true, pos, double_click)
+		_parse_mouse_button(button_index, false, pos, false)
 
 	return ""
+
+# One press or release at a window position. Like a physical mouse, the event's button_mask holds the
+# buttons down after it: the pressed button included on a press, excluded on a release.
+func _parse_mouse_button(button_index: MouseButton, pressed: bool, window_pos: Vector2, double_click: bool) -> void:
+	var bit := 1 << (int(button_index) - 1)
+	_injected_button_mask = (_injected_button_mask | bit) if pressed else (_injected_button_mask & ~bit)
+	var event := InputEventMouseButton.new()
+	event.button_index = button_index
+	event.pressed = pressed
+	event.position = window_pos
+	event.global_position = window_pos
+	event.double_click = double_click
+	event.button_mask = _injected_button_mask
+	Input.parse_input_event(event)
 
 func _inject_mouse_motion(action: Dictionary) -> void:
 	var event = InputEventMouseMotion.new()
@@ -417,7 +417,7 @@ func _inject_mouse_motion(action: Dictionary) -> void:
 	event.relative = _viewport_delta_to_window(Vector2(action.get("relative_x", 0), action.get("relative_y", 0)))
 	# A physical mouse reports held buttons in its motion events. Handlers that read button_mask,
 	# and Godot's own drag-and-drop, need the same from injected motion.
-	event.button_mask = Input.get_mouse_button_mask()
+	event.button_mask = _injected_button_mask
 	Input.parse_input_event(event)
 
 # Callers give positions in the root viewport's coordinates: the space get_ui_elements reports
@@ -430,10 +430,56 @@ func _viewport_to_window(pos: Vector2) -> Vector2:
 func _viewport_delta_to_window(delta: Vector2) -> Vector2:
 	return get_tree().root.get_final_transform().basis_xform(delta)
 
-# A Control's rect in root-viewport coordinates, CanvasLayer transforms included.
-func _control_viewport_rect(ctrl: Control) -> Rect2:
+# The transform from a Control's local space to root-viewport pixels, through every viewport between:
+# a SubViewport shown by a SubViewportContainer (scaled when the container stretches it), or an
+# embedded Window (at its position in the viewport that embeds it). CanvasLayers are included by
+# get_global_transform_with_canvas. null when a viewport on the way is not displayed in the root
+# viewport (a SubViewport outside any container, a hidden container or window, a native window).
+func _control_to_root(ctrl: Control) -> Variant:
 	var xform := ctrl.get_global_transform_with_canvas()
-	return Rect2(xform.origin, xform.basis_xform(ctrl.size))
+	var vp := ctrl.get_viewport()
+	var root := get_tree().root
+	while vp != root:
+		if vp is SubViewport:
+			var container := vp.get_parent() as SubViewportContainer
+			if container == null or not container.is_visible_in_tree():
+				return null
+			var scale := Vector2.ONE
+			var shown := Vector2((vp as SubViewport).size)
+			if container.stretch and shown.x > 0.0 and shown.y > 0.0:
+				scale = container.size / shown  # SubViewportContainer draws the texture over its own size
+			xform = container.get_global_transform_with_canvas() * Transform2D(0.0, scale, 0.0, Vector2.ZERO) * xform
+			vp = container.get_viewport()
+		elif vp is Window and (vp as Window).is_embedded() and (vp as Window).visible:
+			var window := vp as Window
+			var embedder := _embedder_of(window)
+			if embedder == null:
+				return null
+			xform = Transform2D(0.0, Vector2(window.position)) * window.get_final_transform() * xform
+			vp = embedder
+		else:
+			return null
+	return xform
+
+# The viewport an embedded Window is drawn in: the nearest viewport above it that embeds subwindows
+# (Window::get_embedder, which GDScript cannot call).
+func _embedder_of(window: Window) -> Viewport:
+	var parent := window.get_parent()
+	var vp: Viewport = parent.get_viewport() if parent != null else null
+	while vp != null:
+		if vp.gui_embed_subwindows:
+			return vp
+		parent = vp.get_parent()
+		vp = parent.get_viewport() if parent != null else null
+	return null
+
+# The axis-aligned bounds of a size-sized rect's four corners under xform, so a rotated or skewed
+# Control gets its whole footprint (one transformed diagonal is not a rect once there is rotation).
+func _bounds(xform: Transform2D, size: Vector2) -> Rect2:
+	var rect := Rect2(xform * Vector2.ZERO, Vector2.ZERO)
+	for corner in [Vector2(size.x, 0.0), Vector2(0.0, size.y), size]:
+		rect = rect.expand(xform * corner)
+	return rect
 
 func _inject_action(action: Dictionary) -> String:
 	var action_name = action.get("action", "")
@@ -466,22 +512,13 @@ func _inject_click_element(action: Dictionary) -> String:
 		return button_result[1]
 	var button_index: MouseButton = button_result[0]
 	var double_click: bool = action.get("double_click", false)
-	var center := _viewport_to_window(_control_viewport_rect(target).get_center())
+	var to_root = _control_to_root(target)
+	if to_root == null:
+		return "UI element '%s' is not displayed in the root viewport (its viewport is not shown by a SubViewportContainer or an embedded Window)" % identifier
+	var center := _viewport_to_window((to_root as Transform2D) * (target.size / 2.0))
 
-	var press := InputEventMouseButton.new()
-	press.button_index = button_index
-	press.pressed = true
-	press.position = center
-	press.global_position = center
-	press.double_click = double_click
-	Input.parse_input_event(press)
-
-	var release := InputEventMouseButton.new()
-	release.button_index = button_index
-	release.pressed = false
-	release.position = center
-	release.global_position = center
-	Input.parse_input_event(release)
+	_parse_mouse_button(button_index, true, center, double_click)
+	_parse_mouse_button(button_index, false, center, false)
 
 	return ""
 
@@ -505,7 +542,8 @@ func _collect_control_nodes(node: Node, elements: Array[Dictionary], visible_onl
 			for child in node.get_children():
 				_collect_control_nodes(child, elements, visible_only, type_filter)
 			return
-		var rect := _control_viewport_rect(ctrl)
+		var to_root = _control_to_root(ctrl)
+		var rect := _bounds(to_root if to_root != null else ctrl.get_global_transform_with_canvas(), ctrl.size)
 		var element := {
 			"name": String(ctrl.name),
 			"type": ctrl.get_class(),
@@ -518,6 +556,8 @@ func _collect_control_nodes(node: Node, elements: Array[Dictionary], visible_onl
 			},
 			"visible": ctrl.is_visible_in_tree(),
 		}
+		if to_root == null:
+			element["mapped"] = false  # rect is in its own viewport's pixels; click_element refuses it
 		# Extract text content for common Control types
 		if ctrl is Button:
 			element["text"] = (ctrl as Button).text

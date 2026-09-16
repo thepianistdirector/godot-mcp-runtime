@@ -33,6 +33,7 @@ const parameterMappings = {
   file_types: 'fileTypes',
   max_results: 'maxResults',
   capture_limit: 'captureLimit',
+  user_args: 'userArgs',
 } as const satisfies Record<string, string>;
 
 type ForwardMap = typeof parameterMappings;

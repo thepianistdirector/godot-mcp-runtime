@@ -438,6 +438,7 @@ export class GodotRunner {
     background: boolean = false,
     bridgePort?: number,
     profiling: boolean = false,
+    userArgs: readonly string[] = [],
   ): Promise<GodotProcess> {
     if (!this.godotPath) {
       throw new Error(
@@ -502,6 +503,13 @@ export class GodotRunner {
     if (scene && validateSubPath(projectPath, scene)) {
       logDebug(`Adding scene parameter: ${scene}`);
       cmdArgs.push(scene);
+    }
+    // The game's own arguments go last, after a standalone `--`. Godot parses nothing after it and
+    // hands it all to OS.get_cmdline_user_args(), so a user arg can never act as an engine option
+    // (--path, --script). spawn passes each entry as one argv element, never through a shell.
+    if (userArgs.length > 0) {
+      logDebug(`Adding ${userArgs.length} user argument(s) after --`);
+      cmdArgs.push('--', ...userArgs);
     }
 
     const portSource = bridgePort !== undefined ? 'explicit' : 'auto';

@@ -17,6 +17,7 @@ import {
   optionalString,
   optionalNumber,
   optionalBoolean,
+  optionalStringArray,
   requireString,
   requireArray,
 } from '../utils/arg-parsing.js';
@@ -83,7 +84,7 @@ export const runtimeToolDefinitions = [
   {
     name: 'run_project',
     description:
-      'Spawn a Godot project as a child process with stdout/stderr captured. Required before take_screenshot, simulate_input, get_ui_elements, run_script, or get_debug_output. Set profiling: true at launch to enable the profiler tools. Use attach_project for one you launched yourself. Verifies MCP bridge readiness before returning success. Returns status with the assigned bridge port. Call stop_project when done. Errors if projectPath is not a Godot project or another session is already active.',
+      "Spawn a Godot project as a child process with stdout/stderr captured. Required before take_screenshot, simulate_input, get_ui_elements, run_script, or get_debug_output. Set profiling: true at launch to enable the profiler tools. Pass userArgs for the game's own command-line arguments. Use attach_project for one you launched yourself. Verifies MCP bridge readiness before returning success. Returns status with the assigned bridge port. Call stop_project when done. Errors if projectPath is not a Godot project or another session is already active.",
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
@@ -113,6 +114,12 @@ export const runtimeToolDefinitions = [
           type: 'boolean',
           description:
             "Attach Godot's own remote debugger so profile_project, start_profiler and stop_profiler can measure this session. Must be set at launch - a session already running cannot be profiled - and costs a little runtime overhead.",
+        },
+        userArgs: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Command-line arguments for the game itself, e.g. ["--save-root=/tmp/run1", "--new"]. Appended after a standalone `--`, one argv entry each and never through a shell, so Godot never reads them as engine options; the game reads them with OS.get_cmdline_user_args().',
         },
       },
       required: ['projectPath'],
@@ -269,7 +276,7 @@ export const runtimeToolDefinitions = [
   {
     name: 'simulate_input',
     description:
-      "Simulate sequential input in a running project. Each action's `type` (key, mouse_button, mouse_motion, click_element, action, wait) gates which other fields apply - see per-property docs. For click_element use get_ui_elements first; resolution is by path/name, not visible text. Press/release require two actions; insert wait between for frame ticks. Returns: success, actions_processed, warnings for runtime errors fired by input handlers. Errors if no session or any action fails validation.",
+      "Simulate sequential input in a running project. Each action's `type` (key, mouse_button, mouse_motion, click_element, action, wait) gates which other fields apply - see per-property docs. For click_element use get_ui_elements first; resolution is by path/name, not visible text. Press/release require two actions; insert wait between for frame ticks. A mouse_motion carries the buttons this tool has pressed and not yet released in its button_mask, within one batch too, so a press, motions and a release in one call make a drag. Returns: success, actions_processed, warnings for runtime errors fired by input handlers. Errors if no session or any action fails validation.",
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
@@ -370,7 +377,7 @@ export const runtimeToolDefinitions = [
   {
     name: 'get_ui_elements',
     description:
-      'Walk the running scene tree and return all Control nodes with positions, sizes, types, and text content. Always call this before simulate_input click_element actions to discover valid element names and paths. Requires an active runtime session (run_project or attach_project). visibleOnly defaults true; pass false to include hidden Controls. filter narrows by class. Returns: elements[] with path/type/rect/visible plus optional text/disabled/tooltip.',
+      "Walk the running scene tree and return all Control nodes with positions, sizes, types, and text content. Always call this before simulate_input click_element actions to discover valid element names and paths. Requires an active runtime session (run_project or attach_project). visibleOnly defaults true; pass false to include hidden Controls. filter narrows by class. Rects are in root-viewport pixels (the space of take_screenshot and simulate_input x/y) through CanvasLayers, SubViewportContainers and embedded Windows, as the bounds of the four transformed corners. A Control in a viewport that nothing on screen displays has mapped: false and a rect in that viewport's own pixels; click_element refuses it. Returns: elements[] with path/type/rect/visible plus optional text/disabled/tooltip/mapped.",
     annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
@@ -412,6 +419,7 @@ export const runtimeToolDefinitions = [
               placeholder: { type: 'string' },
               disabled: { type: 'boolean' },
               tooltip: { type: 'string' },
+              mapped: { type: 'boolean' },
             },
           },
         },
@@ -769,6 +777,18 @@ export async function handleRunProject(
     }
   }
 
+  // Validated before the pre-flight scan and the confirmation prompt, so a malformed call never
+  // asks the user anything. spawn would throw on a NUL byte; refuse it here with a clear message.
+  const userArgs = optionalStringArray(args, 'userArgs');
+  if (!userArgs.ok) return userArgs;
+  if (userArgs.value?.some((a) => a.includes('\0'))) {
+    return err(
+      createErrorResponse('Invalid userArgs: an entry contains a NUL byte', [
+        'Pass each argument as a plain string without NUL characters',
+      ]),
+    );
+  }
+
   // Pre-flight security scan: autoloads + the launched scene's scripts,
   // scanning transitively into every PackedScene it instances (subscene
   // recursion — see collectSceneScriptsRecursive). Result is a list of
@@ -963,7 +983,14 @@ export async function handleRunProject(
   const isProfiling = profiling.value === true;
 
   try {
-    await runner.runProject(projectPath, scene.value, isBackground, bridgePort.value, isProfiling);
+    await runner.runProject(
+      projectPath,
+      scene.value,
+      isBackground,
+      bridgePort.value,
+      isProfiling,
+      userArgs.value ?? [],
+    );
 
     const bridgeResult = await runner.waitForBridge();
 
