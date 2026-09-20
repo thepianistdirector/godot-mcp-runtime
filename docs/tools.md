@@ -2,6 +2,42 @@
 
 The full MCP tool reference for Godot MCP Runtime. This file always reflects `main`; for older releases, browse the corresponding git tag.
 
+## Runtime sessions in this fork
+
+Each canonical `projectPath` owns one runner, bridge, process, output buffer and profiler. Pass the same absolute `projectPath` to every runtime and profiler call, including `stop_project`. Symlink, relative and on-disk case aliases resolve to the same project. Conflicting `projectPath` and `project_path` values are refused. A path naming no session never borrows another project's game.
+
+A second `run_project` for the same project replaces only that project's game. Argument and security checks finish before launch admission can stop anything. Lifecycle calls on one path queue in order, including a stop submitted immediately behind a launch; calls to different projects can overlap. A failed launch releases its reservation and cleans up only the child created by that attempt. Processes are recorded at spawn, before bridge readiness.
+
+`list_sessions` is read-only. It returns `sessions`, `recentlyEnded` and `limits`. Sessions identify the path, mode (`spawned` or `attached`), state (`launching`, `live` or `exited`), PID, bridge port, profiler, start, idle duration and last command times. History keeps the last 20 process endings, each with PID and OS start identity, reason (`stopped`, `idle_stop`, `replaced`, `exited`, `launch_failed`, `server_shutdown`), exit code and time. A launch failure before a child exists has a null PID. A retained exited record is not a live session.
+
+When `requireProjectPath` is false, an omitted path can select the sole live session; two or more sessions require an explicit path. When it is true, every session call needs a path regardless of session count. Headless scene editing remains blocked only by a runtime on that same project.
+
+`run_project` launch options:
+
+- `background: true` parks the window and blocks physical input while preserving programmatic input and captures. Background defaults may cap frames and silence audio.
+- `maxFps` is an integer from 0 to 1000; 0 means uncapped. It overrides the background frame cap and also works on a visible run. It does not control audio.
+- `audio: true` preserves the normal audio driver even on a background run. Use it for sound review. A driver name or an internal bus capture alone does not prove system output.
+- `idleStopMinutes: 0` exempts this session from idle cleanup. Omission (or a positive value) restores the server setting for each new session, including replacement. Idle time starts when the last command completes; an in-flight command is never idle.
+- `userArgs` stays after a standalone `--` and cannot become engine options. `bridgePort`, `scene` and `profiling` retain their existing meanings.
+
+## Multi-game server configuration
+
+The server reads `<package-root>/godot-mcp.config.json`, or the file named by `GODOT_MCP_CONFIG`. The environment overrides file values. Missing settings preserve upstream behavior. Invalid settings are diagnosed on stderr and ignored; security switches cannot be configured through this file.
+
+| Setting                 | Environment override                | Default               |
+| ----------------------- | ----------------------------------- | --------------------- |
+| `requireProjectPath`    | `GODOT_MCP_REQUIRE_PROJECT_PATH`    | `false`               |
+| `maxGames`              | `GODOT_MCP_MAX_GAMES`               | `0` (no cap)          |
+| `backgroundMaxFps`      | `GODOT_MCP_BACKGROUND_MAX_FPS`      | `0` (no cap)          |
+| `backgroundAudioDriver` | `GODOT_MCP_BACKGROUND_AUDIO_DRIVER` | empty (normal driver) |
+| `idleStopMinutes`       | `GODOT_MCP_IDLE_STOP_MINUTES`       | `0` (disabled)        |
+
+`GODOT_MCP_STATE_DIR` selects the ownership-record directory (default `<package-root>/state`). Each record contains the game PID and OS start time, canonical path, server PID and server start time. Shutdown removes only records belonging to children this pool actually spawned, matching both identities. An observer pool cannot remove another server's record.
+
+Admission counts host Godot games plus this server's pending launches. At the cap it refuses immediately; it never waits while holding a project mutex. A process-table inspection failure refuses admission and reports `limits.gamesOnHost: null` with `processInspectionError`, never a false zero. The host cap is soft across different servers starting simultaneously. Windows process inspection is unavailable, so this fork refuses pooled launches there until an inspector is provided; this Mac fork does not claim Windows multi-game support.
+
+The process parser reads engine arguments only before `--`, excludes headless, editor and project-manager processes (`-e`, `--editor`, `-p`, `--project-manager`), and stops the parsed path at the first short or long option. Spaces inside a path are retained. Because `ps` loses argument boundaries, ambiguous space-prefix matches are conservatively treated as the same project. A matching PID/start record takes precedence over the parsed path. A foreign live game is refused; automatic orphan cleanup requires a matching ownership record whose server has exited.
+
 ## Project Management
 
 | Tool               | Description                                                                                                                                                                                                                                                                                                                                                                            |

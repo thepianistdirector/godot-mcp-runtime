@@ -84,6 +84,8 @@ export interface GodotServerConfig {
    * server never hand out the same port inside the bind window.
    */
   allocatePort?: () => Promise<number>;
+  /** Pool ownership publication, immediately after a child is spawned (before bridge polling). */
+  onSpawn?: (proc: GodotProcess) => void;
 }
 
 /** Engine options `runProject` adds before the `--` separator. */
@@ -174,9 +176,11 @@ export class GodotRunner {
   private rxTotal = 0;
   private inFlight: InFlightCommand | null = null;
   private allocatePort: () => Promise<number>;
+  private readonly onSpawn: GodotServerConfig['onSpawn'];
 
   constructor(config?: GodotServerConfig) {
     this.allocatePort = config?.allocatePort ?? findFreePort;
+    this.onSpawn = config?.onSpawn;
     this.operationsScriptPath = join(__dirname, '..', 'scripts', 'godot_operations.gd');
     const bridgeScriptPath = join(__dirname, '..', 'scripts', 'mcp_bridge.gd');
     this.bridge = new BridgeManager(bridgeScriptPath);
@@ -605,6 +609,10 @@ export class GodotRunner {
     });
 
     this.activeProcess = godotProcess;
+    if (this.onSpawn) {
+      if (proc.pid !== undefined) this.onSpawn(godotProcess);
+      else proc.once('spawn', () => this.onSpawn?.(godotProcess));
+    }
     return this.activeProcess;
   }
 

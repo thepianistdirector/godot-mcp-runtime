@@ -21,7 +21,7 @@ import { execFileSync } from 'child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { isAbsolute, join, resolve, sep } from 'path';
 
-import { GodotRunner, type GodotServerConfig } from './godot-runner.js';
+import { GodotRunner, type GodotProcess, type GodotServerConfig } from './godot-runner.js';
 import { findFreePort } from './bridge-protocol.js';
 import { DEFAULT_SERVER_CONFIG, type ServerConfig } from './server-config.js';
 import { logDebug } from './logger.js';
@@ -113,19 +113,17 @@ export function parsePs(text: string): HostProcess[] {
 }
 
 export const defaultProcessLister: ProcessLister = () => {
-  if (process.platform === 'win32') return [];
-  try {
-    // LC_ALL=C: `lstart` is localised. On a Spanish macOS it prints "sáb 19 sep …", which the
-    // parser does not read, and an empty table silently switches the host budget off.
-    const text = execFileSync('ps', ['-axo', 'pid=,ppid=,rss=,lstart=,command='], {
-      env: { ...process.env, LC_ALL: 'C' },
-      encoding: 'utf8',
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    return parsePs(text);
-  } catch {
-    return [];
-  }
+  if (process.platform === 'win32') throw new Error('Process inspection is unavailable on Windows');
+  // LC_ALL=C: `lstart` is localised. On a Spanish macOS it prints "sáb 19 sep …", which the
+  // parser does not read, and an empty table silently switches the host budget off.
+  const text = execFileSync('ps', ['-axo', 'pid=,ppid=,rss=,lstart=,command='], {
+    env: { ...process.env, LC_ALL: 'C' },
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const rows = parsePs(text);
+  if (rows.length === 0) throw new Error('ps returned no readable process rows');
+  return rows;
 };
 
 export interface HostGame extends HostProcess {
@@ -143,29 +141,45 @@ export interface HostGame extends HostProcess {
 export function gamesOnHost(procs: HostProcess[]): HostGame[] {
   const games: HostGame[] = [];
   for (const p of procs) {
-    const tokens = p.command.split(/\s+/);
-    const bin = tokens[0] ?? '';
+    const tokens = [...p.command.matchAll(/\S+/g)];
+    const bin = tokens[0]?.[0] ?? '';
     if (!/(^|\/)godot[^/]*$/i.test(bin)) continue;
-    const end = tokens.indexOf('--');
+    const end = tokens.findIndex((t) => t[0] === '--');
     const engine = end === -1 ? tokens.slice(1) : tokens.slice(1, end);
-    if (engine.includes('--headless') || engine.includes('-e') || engine.includes('--editor')) {
+    if (
+      engine.some((t) => ['--headless', '-e', '--editor', '-p', '--project-manager'].includes(t[0]))
+    ) {
       continue;
     }
-    const i = engine.indexOf('--path');
+    const i = engine.findIndex((t) => t[0] === '--path');
     if (i === -1 || i + 1 >= engine.length) continue;
     // A path with spaces is split by ps; rejoin up to the next engine flag.
-    const parts: string[] = [];
+    const parts: RegExpExecArray[] = [];
     for (const token of engine.slice(i + 1)) {
-      if (token.startsWith('--')) break;
+      if (token[0].startsWith('-')) break;
       parts.push(token);
     }
     // A scene argument (res://… or *.tscn) follows the path; it is not part of it.
-    while (parts.length > 1 && /(^res:\/\/|\.t?scn$)/.test(parts[parts.length - 1] ?? '')) {
+    while (parts.length > 1 && /(^res:\/\/|\.t?scn$)/.test(parts.at(-1)?.[0] ?? '')) {
       parts.pop();
     }
-    games.push({ ...p, projectPath: projectKey(parts.join(' ')) });
+    const first = parts[0];
+    const last = parts.at(-1);
+    if (first && last) {
+      games.push({
+        ...p,
+        projectPath: projectKey(p.command.slice(first.index, last.index + last[0].length)),
+      });
+    }
   }
   return games;
+}
+
+/** ps loses argv boundaries. An ambiguous space-prefix must refuse, never admit a duplicate. */
+function possiblySameProject(parsed: string, key: string): boolean {
+  const a = parsed.replace(/\s+/g, ' ');
+  const b = key.replace(/\s+/g, ' ');
+  return a === b || a.startsWith(b + ' ') || b.startsWith(a + ' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +215,13 @@ export type Resolution =
   | { kind: 'runner'; runner: GodotRunner; key: string | null }
   | { kind: 'refusal'; message: string };
 
-export type EndReason = 'stopped' | 'exited' | 'idle' | 'replaced' | 'launch_failed';
+export type EndReason =
+  | 'stopped'
+  | 'exited'
+  | 'idle_stop'
+  | 'replaced'
+  | 'launch_failed'
+  | 'server_shutdown';
 
 export interface SessionInfo {
   projectPath: string;
@@ -229,6 +249,9 @@ interface Entry {
   lastCommand: { tool: string; startedAt: number; finishedAt: number | null } | null;
   /** Tail of the per-key lifecycle chain. */
   chain: Promise<unknown>;
+  queued: number;
+  attempt: { previous: GodotProcess | null; child: GodotProcess | null } | null;
+  owned: OwnedProcess | null;
 }
 
 interface PidFile {
@@ -237,6 +260,13 @@ interface PidFile {
   projectPath: string;
   serverPid: number;
   serverStartedAt: string;
+}
+
+interface OwnedProcess {
+  proc: GodotProcess;
+  record: PidFile;
+  intent: EndReason | null;
+  ended: boolean;
 }
 
 export interface RunnerPoolOptions {
@@ -269,12 +299,14 @@ export class RunnerPool {
     projectPath: string;
     reason: EndReason;
     exitCode: number | null;
+    pid: number | null;
+    startedAt: string | null;
     at: string;
   }[] = [];
   private idleEnded = new Map<string, number>();
   private sweepTimer: NodeJS.Timeout | null = null;
-  private fixedRunner: GodotRunner | null = null;
   private serverStartedAt: string | null = null;
+  private shuttingDown = false;
 
   constructor(options: RunnerPoolOptions = {}) {
     this.serverConfig = options.serverConfig ?? { ...DEFAULT_SERVER_CONFIG };
@@ -299,16 +331,6 @@ export class RunnerPool {
     }
   }
 
-  /**
-   * A pool that always answers with one runner. `dispatchToolCall` wraps a bare
-   * GodotRunner in it, so every existing call site and test keeps its meaning.
-   */
-  static single(runner: GodotRunner): RunnerPool {
-    const pool = new RunnerPool({ createRunner: () => runner });
-    pool.fixedRunner = runner;
-    return pool;
-  }
-
   get idleRunner(): GodotRunner {
     return this.defaultRunner;
   }
@@ -330,7 +352,10 @@ export class RunnerPool {
     if (!e) {
       e = {
         key,
-        runner: this.createRunner(this.runnerConfig),
+        runner: this.createRunner({
+          ...this.runnerConfig,
+          onSpawn: (proc) => this.spawned(key, proc),
+        }),
         launching: false,
         startedAt: null,
         lastFinishedAt: null,
@@ -338,6 +363,9 @@ export class RunnerPool {
         noIdleStop: false,
         lastCommand: null,
         chain: Promise.resolve(),
+        queued: 0,
+        attempt: null,
+        owned: null,
       };
       this.entries.set(key, e);
     }
@@ -363,12 +391,11 @@ export class RunnerPool {
 
   private liveKeys(): string[] {
     return [...this.entries.values()]
-      .filter((e) => e.launching || RunnerPool.isLive(e.runner))
+      .filter((e) => e.queued > 0 || e.launching || RunnerPool.isLive(e.runner))
       .map((e) => e.key);
   }
 
   resolve(toolName: string, key: string | null): Resolution {
-    if (this.fixedRunner) return { kind: 'runner', runner: this.fixedRunner, key };
     if (NO_PROJECT_TOOLS.has(toolName)) {
       return { kind: 'runner', runner: this.defaultRunner, key: null };
     }
@@ -381,7 +408,7 @@ export class RunnerPool {
     }
     if (key !== null) {
       const e = this.entries.get(key);
-      if (e && (e.launching || RunnerPool.hasSession(e.runner))) {
+      if (e && (e.queued > 0 || e.launching || RunnerPool.hasSession(e.runner))) {
         return { kind: 'runner', runner: e.runner, key };
       }
       return { kind: 'refusal', message: this.refusalNoSession(key) };
@@ -426,7 +453,7 @@ export class RunnerPool {
   // -------------------------------------------------------------------------
 
   isLifecycleTool(toolName: string): boolean {
-    return !this.fixedRunner && LIFECYCLE_TOOLS.has(toolName);
+    return LIFECYCLE_TOOLS.has(toolName);
   }
 
   /**
@@ -437,7 +464,15 @@ export class RunnerPool {
    */
   withLifecycle<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const e = this.entryFor(key);
-    const run = e.chain.then(fn, fn);
+    e.queued += 1;
+    const invoke = async () => {
+      try {
+        return await fn();
+      } finally {
+        e.queued -= 1;
+      }
+    };
+    const run = e.chain.then(invoke, invoke);
     e.chain = run.then(
       () => undefined,
       () => undefined,
@@ -452,24 +487,45 @@ export class RunnerPool {
    * budget until `settleLaunch`.
    */
   admit(key: string): string | null {
+    if (this.shuttingDown) return 'The MCP server is shutting down; reconnect before launching.';
     const e = this.entryFor(key);
-    const procs = this.listProcesses();
+    let procs: HostProcess[];
+    try {
+      procs = this.listProcesses();
+    } catch (error) {
+      return `Process inspection failed: ${String(error)}. Cannot establish ownership or host capacity; retry when ps is available.`;
+    }
     const games = gamesOnHost(procs);
-    const ownPid = e.runner.activeProcess?.process.pid ?? null;
+    const active = e.runner.activeProcess;
+    const ownPid = active && !active.hasExited ? (active.process.pid ?? null) : null;
+    const rec = this.readPidFile(key);
 
     // Same-path strangers: the server kills only what a server of this build
     // started and whose server is gone. Anything else is a refusal.
     for (const g of games) {
-      if (g.projectPath !== key || g.pid === ownPid) continue;
-      const rec = this.readPidFile(key);
-      const ours = rec !== null && rec.pid === g.pid && rec.startedAt === g.startedAt ? rec : null;
+      const ours =
+        rec !== null &&
+        rec.projectPath === key &&
+        rec.pid === g.pid &&
+        rec.startedAt === g.startedAt
+          ? rec
+          : null;
+      const ownedIdentityMatches = !e.owned || e.owned.record.startedAt === g.startedAt;
+      if (
+        (!ours && !possiblySameProject(g.projectPath, key)) ||
+        (g.pid === ownPid && ownedIdentityMatches)
+      )
+        continue;
       const serverAlive =
         ours !== null &&
         procs.some((p) => p.pid === ours.serverPid && p.startedAt === ours.serverStartedAt);
-      if (ours !== null && !serverAlive) {
+      const liveNodeParent = procs.some(
+        (p) => p.pid === g.ppid && /(?:^|\/)node(?:\s|$)/.test(p.command),
+      );
+      if (ours !== null && ours.serverStartedAt && !serverAlive && !liveNodeParent) {
         logDebug(`Reaping orphan game ${g.pid} for ${key} (its server ${ours.serverPid} is gone)`);
         this.kill(g.pid);
-        this.removePidFile(key);
+        this.removeMatchingRecord(ours);
         continue;
       }
       return (
@@ -498,51 +554,115 @@ export class RunnerPool {
       }
     }
     e.launching = true;
+    e.attempt = { previous: e.runner.activeProcess, child: null };
     this.idleEnded.delete(key);
     return null;
   }
 
-  /**
-   * End the `launching` state whatever happened. On success the ownership
-   * record is written; on failure a surviving child is ours, so it is stopped.
-   */
+  /** Called only after the handler has validated and authorised every launch argument. */
+  prepareLaunch(key: string): string | null {
+    const refusal = this.admit(key);
+    if (refusal !== null) return refusal;
+    this.markStopping(key, 'replaced');
+    return null;
+  }
+
+  /** Publish ownership synchronously at the runner's spawn boundary, before bridge readiness. */
+  private spawned(key: string, proc: GodotProcess): void {
+    const e = this.entryFor(key);
+    if (e.owned?.proc === proc) return;
+    if (e.attempt) e.attempt.child = proc;
+    let procs: HostProcess[] = [];
+    try {
+      procs = this.listProcesses();
+    } catch (error) {
+      logDebug(`Spawn identity inspection failed: ${String(error)}`);
+    }
+    this.serverStartedAt ??= procs.find((p) => p.pid === process.pid)?.startedAt ?? '';
+    const owned: OwnedProcess = {
+      proc,
+      intent: null,
+      ended: false,
+      record: {
+        pid: proc.process.pid ?? -1,
+        startedAt: procs.find((p) => p.pid === proc.process.pid)?.startedAt ?? '',
+        projectPath: key,
+        serverPid: process.pid,
+        serverStartedAt: this.serverStartedAt,
+      },
+    };
+    e.owned = owned;
+    e.startedAt = this.now();
+    this.writePidFile(owned.record);
+    proc.process.once('exit', (code) =>
+      this.finishProcess(owned, typeof code === 'number' ? code : null),
+    );
+    proc.process.once('error', () => {
+      owned.intent = 'launch_failed';
+      this.finishProcess(owned, null);
+    });
+    if (proc.hasExited) this.finishProcess(owned, proc.exitCode);
+  }
+
+  /** Reconcile only this attempt's child; a pre-flight error never owns the previous game. */
   async settleLaunch(key: string, succeeded: boolean): Promise<void> {
     const e = this.entries.get(key);
-    if (!e) return;
-    e.launching = false;
+    if (!e?.attempt) return;
     const proc = e.runner.activeProcess;
-    if (succeeded && proc && !proc.hasExited && proc.process.pid !== undefined) {
-      e.startedAt = this.now();
-      this.writePidFile(key, proc.process.pid);
-      proc.process.once('exit', (code) => {
-        this.removePidFile(key, proc.process.pid);
-        this.noteEnded(key, 'exited', typeof code === 'number' ? code : null);
-      });
-      return;
-    }
-    if (!succeeded) {
-      if (proc && !proc.hasExited) {
-        try {
-          await e.runner.stopProject();
-        } catch {
-          // best effort: the record below is removed either way
+    // Test/custom runners may not implement the callback; production has already registered it.
+    if (proc && proc !== e.attempt?.previous && e.owned?.proc !== proc) this.spawned(key, proc);
+    try {
+      if (!succeeded) {
+        const child = e.attempt?.child;
+        if (child && e.owned?.proc === child) {
+          e.owned.intent = 'launch_failed';
+          if (e.runner.activeProcess === child) await e.runner.stopProject();
+          this.finishProcess(e.owned, child.exitCode);
+        } else if (e.owned && !e.owned.ended) {
+          e.owned.intent = null;
+        } else {
+          this.recentlyEnded.push({
+            projectPath: key,
+            reason: 'launch_failed',
+            exitCode: null,
+            pid: null,
+            startedAt: null,
+            at: new Date(this.now()).toISOString(),
+          });
+          if (this.recentlyEnded.length > 20) this.recentlyEnded.shift();
         }
       }
-      this.removePidFile(key);
-      this.noteEnded(key, 'launch_failed', null);
+    } finally {
+      e.launching = false;
+      e.attempt = null;
     }
+  }
+
+  markStopping(key: string, reason: EndReason): void {
+    const owned = this.entries.get(key)?.owned;
+    if (owned && !owned.ended) owned.intent = reason;
   }
 
   noteStopped(key: string): void {
-    this.removePidFile(key);
-    this.noteEnded(key, 'stopped', null);
+    const owned = this.entries.get(key)?.owned;
+    if (owned) {
+      owned.intent ??= 'stopped';
+      this.finishProcess(owned, owned.proc.exitCode);
+    }
   }
 
-  private noteEnded(key: string, reason: EndReason, exitCode: number | null): void {
-    const last = this.recentlyEnded[this.recentlyEnded.length - 1];
-    const at = new Date(this.now()).toISOString();
-    if (last && last.projectPath === key && this.now() - Date.parse(last.at) < 2000) return;
-    this.recentlyEnded.push({ projectPath: key, reason, exitCode, at });
+  private finishProcess(owned: OwnedProcess, exitCode: number | null): void {
+    if (owned.ended) return;
+    owned.ended = true;
+    this.removeMatchingRecord(owned.record);
+    this.recentlyEnded.push({
+      projectPath: owned.record.projectPath,
+      reason: owned.intent ?? 'exited',
+      exitCode,
+      pid: owned.record.pid,
+      startedAt: owned.record.startedAt,
+      at: new Date(this.now()).toISOString(),
+    });
     if (this.recentlyEnded.length > 20) this.recentlyEnded.shift();
   }
 
@@ -575,16 +695,16 @@ export class RunnerPool {
     const limitMs = this.serverConfig.idleStopMinutes * 60_000;
     if (limitMs <= 0) return;
     for (const e of this.entries.values()) {
-      if (e.launching || e.inFlight > 0 || e.noIdleStop) continue;
+      if (e.queued > 0 || e.launching || e.inFlight > 0 || e.noIdleStop) continue;
       if (e.runner.activeSessionMode !== 'spawned' || !RunnerPool.isLive(e.runner)) continue;
       const since = e.lastFinishedAt ?? e.startedAt;
       if (since === null || this.now() - since < limitMs) continue;
       await this.withLifecycle(e.key, async () => {
-        if (e.inFlight > 0) return;
+        if (e.inFlight > 0 || e.noIdleStop || !RunnerPool.isLive(e.runner)) return;
+        this.markStopping(e.key, 'idle_stop');
         await e.runner.stopProject();
-        this.removePidFile(e.key);
+        this.noteStopped(e.key);
         this.idleEnded.set(e.key, this.now());
-        this.noteEnded(e.key, 'idle', null);
       });
     }
   }
@@ -623,30 +743,14 @@ export class RunnerPool {
     return join(this.stateDir, 'sessions', `${createHash('sha1').update(key).digest('hex')}.json`);
   }
 
-  private ownStartedAt(): string {
-    if (this.serverStartedAt === null) {
-      const me = this.listProcesses().find((p) => p.pid === process.pid);
-      this.serverStartedAt = me?.startedAt ?? '';
-    }
-    return this.serverStartedAt;
-  }
-
-  private writePidFile(key: string, pid: number): void {
-    const path = this.pidFilePath(key);
-    if (!path) return;
+  private writePidFile(rec: PidFile): void {
+    const path = this.pidFilePath(rec.projectPath);
+    if (!path || rec.pid < 0) return;
     try {
-      const startedAt = this.listProcesses().find((p) => p.pid === pid)?.startedAt ?? '';
-      const rec: PidFile = {
-        pid,
-        startedAt,
-        projectPath: key,
-        serverPid: process.pid,
-        serverStartedAt: this.ownStartedAt(),
-      };
       mkdirSync(join(this.stateDir as string, 'sessions'), { recursive: true });
       writeFileSync(path, JSON.stringify(rec));
     } catch (error) {
-      logDebug(`Could not write ownership record for ${key}: ${String(error)}`);
+      logDebug(`Could not write ownership record for ${rec.projectPath}: ${String(error)}`);
     }
   }
 
@@ -661,13 +765,19 @@ export class RunnerPool {
     }
   }
 
-  private removePidFile(key: string, onlyIfPid?: number): void {
-    const path = this.pidFilePath(key);
+  private removeMatchingRecord(expected: PidFile): void {
+    const path = this.pidFilePath(expected.projectPath);
     if (!path) return;
-    if (onlyIfPid !== undefined) {
-      const rec = this.readPidFile(key);
-      if (rec && rec.pid !== onlyIfPid) return;
-    }
+    const rec = this.readPidFile(expected.projectPath);
+    if (
+      !rec ||
+      rec.pid !== expected.pid ||
+      rec.startedAt !== expected.startedAt ||
+      rec.serverPid !== expected.serverPid ||
+      rec.serverStartedAt !== expected.serverStartedAt ||
+      rec.projectPath !== expected.projectPath
+    )
+      return;
     try {
       rmSync(path, { force: true });
     } catch {
@@ -682,7 +792,11 @@ export class RunnerPool {
   list(): {
     sessions: SessionInfo[];
     recentlyEnded: RunnerPool['recentlyEnded'];
-    limits: ServerConfig & { gamesOnHost: number; launching: number };
+    limits: ServerConfig & {
+      gamesOnHost: number | null;
+      launching: number;
+      processInspectionError: string | null;
+    };
   } {
     const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString());
     const sessions: SessionInfo[] = [];
@@ -712,30 +826,42 @@ export class RunnerPool {
           : null,
       });
     }
+    let hostCount: number | null = null;
+    let processInspectionError: string | null = null;
+    try {
+      hostCount = gamesOnHost(this.listProcesses()).length;
+    } catch (error) {
+      processInspectionError = String(error);
+    }
     return {
       sessions,
       recentlyEnded: [...this.recentlyEnded],
       limits: {
         ...this.serverConfig,
-        gamesOnHost: gamesOnHost(this.listProcesses()).length,
+        gamesOnHost: hostCount,
+        processInspectionError,
         launching: [...this.entries.values()].filter((e) => e.launching).length,
       },
     };
   }
 
   async stopAll(): Promise<void> {
+    this.shuttingDown = true;
     if (this.sweepTimer) clearInterval(this.sweepTimer);
-    const runners = this.fixedRunner
-      ? [this.fixedRunner]
-      : [this.defaultRunner, ...[...this.entries.values()].map((e) => e.runner)];
-    await Promise.allSettled(runners.map((r) => r.stopProject()));
-    for (const key of this.entries.keys()) this.removePidFile(key);
+    await Promise.allSettled([
+      this.defaultRunner.stopProject(),
+      ...[...this.entries.values()].map((e) =>
+        this.withLifecycle(e.key, async () => {
+          this.markStopping(e.key, 'server_shutdown');
+          await e.runner.stopProject();
+          this.noteStopped(e.key);
+        }),
+      ),
+    ]);
   }
 
   cleanupBridgeArtifactsSync(): void {
-    const runners = this.fixedRunner
-      ? [this.fixedRunner]
-      : [this.defaultRunner, ...[...this.entries.values()].map((e) => e.runner)];
+    const runners = [this.defaultRunner, ...[...this.entries.values()].map((e) => e.runner)];
     for (const r of runners) {
       try {
         r.cleanupBridgeArtifactsSync();

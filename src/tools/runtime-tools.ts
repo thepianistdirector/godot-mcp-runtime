@@ -166,7 +166,7 @@ export const runtimeToolDefinitions = [
   {
     name: 'list_sessions',
     description:
-      'List the runtime sessions this server holds, one per project path, with the server limits. Use it to see which games are running, which project a refusal was about, why a session ended (stopped, exited, idle, launch_failed), and how close the host is to its budget of games. Takes no arguments and changes nothing. Returns: sessions (projectPath, mode, state launching|live|exited, pid, bridgePort, profiling, startedAt, lastUsedAt, idleSeconds, lastCommand), recentlyEnded (last 20), limits (requireProjectPath, maxGames, gamesOnHost, launching, idleStopMinutes, backgroundMaxFps, backgroundAudioDriver).',
+      'List the runtime sessions this server holds, one per project path, with the server limits. Use it to see which games are running, which project a refusal was about, why each process ended (stopped, exited, idle_stop, replaced, launch_failed, server_shutdown), and how close the host is to its budget of games. Takes no arguments and changes nothing. Returns: sessions (projectPath, mode, state launching|live|exited, pid, bridgePort, profiling, startedAt, lastUsedAt, idleSeconds, lastCommand), recentlyEnded (last 20, including process pid and start), limits (requireProjectPath, maxGames, gamesOnHost, processInspectionError, launching, idleStopMinutes, backgroundMaxFps, backgroundAudioDriver). When process inspection fails, gamesOnHost is null and launches are refused; processInspectionError gives the cause.',
     annotations: { readOnlyHint: true },
     inputSchema: { type: 'object', properties: {}, required: [] },
     outputSchema: {
@@ -834,7 +834,7 @@ export async function handleRunProject(
   if (!scene.ok) return scene;
 
   if (scene.value !== undefined) {
-    if (!validateSubPath(projectPath, scene.value)) {
+    if (scene.value.includes('\0') || !validateSubPath(projectPath, scene.value)) {
       return err(
         createErrorResponse(
           `Invalid scene path: must be project-relative without ".." (got: ${scene.value})`,
@@ -865,6 +865,13 @@ export async function handleRunProject(
   if (!audio.ok) return audio;
   const idleStop = optionalNumber(args, 'idleStopMinutes');
   if (!idleStop.ok) return idleStop;
+  if (idleStop.value !== undefined && (!Number.isFinite(idleStop.value) || idleStop.value < 0)) {
+    return err(
+      createErrorResponse('Invalid idleStopMinutes: a non-negative finite number is required', [
+        'Pass 0 to disable idle stop, or omit it to use the server setting',
+      ]),
+    );
+  }
   if (userArgs.value?.some((a) => a.includes('\0'))) {
     return err(
       createErrorResponse('Invalid userArgs: an entry contains a NUL byte', [
@@ -1078,11 +1085,12 @@ export async function handleRunProject(
   if (isBackground && audio.value !== true && cfg && cfg.backgroundAudioDriver) {
     engine.audioDriver = cfg.backgroundAudioDriver;
   }
-  if (idleStop.value !== undefined && ctx.sessions) {
-    ctx.sessions.setNoIdleStop(projectPath, idleStop.value === 0);
-  }
-
   try {
+    const refusal = ctx.sessions?.prepareLaunch?.(projectPath);
+    if (refusal) {
+      const [first = '', ...rest] = refusal.split('\n');
+      return err(createErrorResponse(first, rest));
+    }
     await runner.runProject(
       projectPath,
       scene.value,
@@ -1092,10 +1100,12 @@ export async function handleRunProject(
       userArgs.value ?? [],
       engine,
     );
+    ctx.sessions?.setNoIdleStop(projectPath, idleStop.value === 0);
 
     const bridgeResult = await runner.waitForBridge();
 
     if (!bridgeResult.ready) {
+      ctx.sessions?.markStopping?.(projectPath, 'launch_failed');
       if (runner.activeProcess && runner.activeProcess.hasExited) {
         // Tear down the spawned-mode session state so a retry of run_project
         // works without an intervening stop_project.

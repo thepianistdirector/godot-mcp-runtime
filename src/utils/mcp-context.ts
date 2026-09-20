@@ -95,6 +95,10 @@ export interface McpContext {
 export interface SessionDirectory {
   list(): { sessions: unknown[]; recentlyEnded: unknown[]; limits: unknown };
   setNoIdleStop(projectKey: string, off: boolean): void;
+  /** Called after argument validation and security approval; refuses without launching. */
+  prepareLaunch?(projectKey: string): string | null;
+  /** Mark failure before a handler tears down its just-spawned child. */
+  markStopping?(projectKey: string, reason: 'launch_failed'): void;
 }
 
 /**

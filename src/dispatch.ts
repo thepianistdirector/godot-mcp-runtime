@@ -133,7 +133,7 @@ export const toolDispatch = {
 
 /**
  * Route one tool call. `runnerOrPool` may be a bare GodotRunner (every existing
- * call site and test): it is wrapped in a pool that always answers with it.
+ * call site and test): bare runners use the original single-runner handler path.
  *
  * With a real pool the order is fixed, and each step exists because a reviewer
  * broke the plan without it:
@@ -185,16 +185,12 @@ export async function dispatchToolCall(
 
   return pool.withLifecycle(key, async () => {
     if (toolName !== 'run_project') {
+      if (toolName === 'stop_project') pool.markStopping(key, 'stopped');
       const response = await invoke();
       if (!response.isError && (toolName === 'stop_project' || toolName === 'detach_project')) {
         pool.noteStopped(key);
       }
       return response;
-    }
-    const refusal = pool.admit(key);
-    if (refusal !== null) {
-      const [first = '', ...rest] = refusal.split('\n');
-      return createErrorResponse(first, rest);
     }
     let succeeded = false;
     try {
