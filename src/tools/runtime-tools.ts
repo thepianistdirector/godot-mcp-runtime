@@ -1,6 +1,6 @@
 import { join, sep, resolve, relative } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import type { GodotRunner } from '../utils/godot-runner.js';
+import type { EngineLaunchOptions, GodotRunner } from '../utils/godot-runner.js';
 import { BRIDGE_WAIT_SPAWNED_TIMEOUT_MS } from '../utils/bridge-protocol.js';
 import type { HandlerResult, OperationParams, ToolDefinition, ToolResponse } from '../mcp.types.js';
 import { normalizeParameters } from '../utils/parameter-conversion.js';
@@ -17,6 +17,7 @@ import {
   optionalString,
   optionalNumber,
   optionalBoolean,
+  optionalStringArray,
   requireString,
   requireArray,
 } from '../utils/arg-parsing.js';
@@ -66,6 +67,38 @@ interface ScreenshotBridgeResponse {
 
 export const runtimeToolDefinitions = [
   {
+    name: 'get_server_info',
+    description:
+      'Inspect the actual running server release and effective multi-game settings without a project or running game. Read-only. Returns: version, symlink-resolved releasePath, requireProjectPath, maxGames (host cap), backgroundMaxFps, backgroundAudioDriver, idleStopMinutes, and current live and launching session counts. Use before changing release routing; no environment variables, tokens, or credentials are exposed.',
+    annotations: { readOnlyHint: true, idempotentHint: true },
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        version: { type: 'string' },
+        releasePath: { type: 'string' },
+        requireProjectPath: { type: 'boolean' },
+        maxGames: { type: 'number' },
+        backgroundMaxFps: { type: 'number' },
+        backgroundAudioDriver: { type: 'string' },
+        idleStopMinutes: { type: 'number' },
+        live: { type: 'number' },
+        launching: { type: 'number' },
+      },
+      required: [
+        'version',
+        'releasePath',
+        'requireProjectPath',
+        'maxGames',
+        'backgroundMaxFps',
+        'backgroundAudioDriver',
+        'idleStopMinutes',
+        'live',
+        'launching',
+      ],
+    },
+  },
+  {
     name: 'launch_editor',
     description:
       'Open the Godot editor GUI for a project for the human user. Use only when the user explicitly asks to "open the editor"; for any agent-driven work, use the headless scene/node tools (add_node, set_node_properties, etc.) instead - the editor cannot be controlled programmatically. Returns plain-text confirmation after spawning the editor process. Errors if projectPath has no project.godot.',
@@ -83,7 +116,7 @@ export const runtimeToolDefinitions = [
   {
     name: 'run_project',
     description:
-      'Spawn a Godot project as a child process with stdout/stderr captured. Required before take_screenshot, simulate_input, get_ui_elements, run_script, or get_debug_output. Set profiling: true at launch to enable the profiler tools. Use attach_project for one you launched yourself. Verifies MCP bridge readiness before returning success. Returns status with the assigned bridge port. Call stop_project when done. Errors if projectPath is not a Godot project or another session is already active.',
+      "Spawn a Godot project as a child process with stdout/stderr captured. Required before take_screenshot, simulate_input, get_ui_elements, run_script, or get_debug_output. Set profiling: true at launch to enable the profiler tools. Pass userArgs for the game's own command-line arguments. Use attach_project for one you launched yourself. Verifies MCP bridge readiness before returning success. Returns status with the assigned bridge port. Call stop_project when done. A second run_project for the same projectPath replaces that project's game and no other; other projects' sessions keep running. Errors if projectPath is not a Godot project, if another Godot game the server did not start is already running that project, or if the server's host budget of games is reached.",
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
@@ -114,6 +147,27 @@ export const runtimeToolDefinitions = [
           description:
             "Attach Godot's own remote debugger so profile_project, start_profiler and stop_profiler can measure this session. Must be set at launch - a session already running cannot be profiled - and costs a little runtime overhead.",
         },
+        maxFps: {
+          type: 'number',
+          description:
+            "Frame cap for this run: an integer from 0 to 1000, 0 = uncapped. Overrides the server's background cap and also applies to a visible run. It does not control audio.",
+        },
+        audio: {
+          type: 'boolean',
+          description:
+            'Keep the real audio driver even on a background run. A server may be configured to give background runs a silent driver so many games do not all reach the speakers; pass audio: true when you have to hear the game (sound review, sound against picture). Default false.',
+        },
+        idleStopMinutes: {
+          type: 'number',
+          description:
+            "Pass 0 to exempt this session from the server's idle stop (a long playtest). Omit to use the server setting.",
+        },
+        userArgs: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Command-line arguments for the game itself, e.g. ["--save-root=/tmp/run1", "--new"]. Appended after a standalone `--`, one argv entry each and never through a shell, so Godot never reads them as engine options; the game reads them with OS.get_cmdline_user_args().',
+        },
       },
       required: ['projectPath'],
     },
@@ -142,13 +196,34 @@ export const runtimeToolDefinitions = [
     },
   },
   {
+    name: 'list_sessions',
+    description:
+      'List the runtime sessions this server holds, one per project path, with the server limits. Use it to see which games are running, which project a refusal was about, why each process ended (stopped, exited, idle_stop, replaced, launch_failed, server_shutdown), and how close the host is to its budget of games. Takes no arguments and changes nothing. Returns: sessions (projectPath, mode, state launching|live|exited, pid, bridgePort, profiling, startedAt, lastUsedAt, idleSeconds, lastCommand), recentlyEnded (last 20, including process pid and start), limits (requireProjectPath, maxGames, gamesOnHost, processInspectionError, launching, idleStopMinutes, backgroundMaxFps, backgroundAudioDriver). When process inspection fails, gamesOnHost is null and launches are refused; processInspectionError gives the cause.',
+    annotations: { readOnlyHint: true },
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        sessions: { type: 'array', items: { type: 'object' } },
+        recentlyEnded: { type: 'array', items: { type: 'object' } },
+        limits: { type: 'object' },
+      },
+    },
+  },
+  {
     name: 'detach_project',
     description:
       'Clear attached-mode runtime state and remove the injected McpBridge autoload. Does NOT stop the manually launched Godot process - that stays running. Use after attach_project when you are done driving the game from MCP. For spawned sessions (run_project), use stop_project instead. Mostly optional now: when the bridge disconnects (you closed Godot), the next runtime tool call probes once and ends the attached session itself, removing the autoload. Calling it afterwards still succeeds idempotently, wording the message to distinguish "an attached session existed and already ended" from "this server never attached to a project". Returns: message confirming detach plus externalProcessPreserved (always true here - that is the point of detach vs stop_project). Errors only when a spawned session is what is active; use stop_project for those.',
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
+      },
       required: [],
     },
     outputSchema: {
@@ -167,6 +242,11 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         limit: {
           type: 'number',
           description: 'Max lines to return (default: 200, from end of output)',
@@ -193,7 +273,13 @@ export const runtimeToolDefinitions = [
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
+      },
       required: [],
     },
     outputSchema: {
@@ -217,6 +303,11 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         timeout: {
           type: 'number',
           description: 'Timeout in milliseconds to wait for the screenshot (default: 10000)',
@@ -269,11 +360,16 @@ export const runtimeToolDefinitions = [
   {
     name: 'simulate_input',
     description:
-      "Simulate sequential input in a running project. Each action's `type` (key, mouse_button, mouse_motion, click_element, action, wait) gates which other fields apply - see per-property docs. For click_element use get_ui_elements first; resolution is by path/name, not visible text. Press/release require two actions; insert wait between for frame ticks. Returns: success, actions_processed, warnings for runtime errors fired by input handlers. Errors if no session or any action fails validation.",
+      "Simulate sequential input in a running project. Each action's `type` (key, mouse_button, mouse_motion, click_element, action, wait) gates which other fields apply - see per-property docs. For click_element use get_ui_elements first; resolution is by path/name, not visible text. Press/release require two actions; insert wait between for frame ticks. A mouse_motion carries the buttons this tool has pressed and not yet released in its button_mask, within one batch too, so a press, motions and a release in one call make a drag. Returns: success, actions_processed, warnings for runtime errors fired by input handlers. Errors if no session or any action fails validation.",
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         actions: {
           type: 'array',
           description:
@@ -312,20 +408,20 @@ export const runtimeToolDefinitions = [
               x: {
                 type: 'number',
                 description:
-                  '[mouse_button, mouse_motion] X position in viewport pixels (0,0 = top-left)',
+                  '[mouse_button, mouse_motion] X position in viewport pixels (0,0 = top-left): the space of get_ui_elements rects and take_screenshot pixels. Converted to window pixels when a stretch mode scales or letterboxes the viewport.',
               },
               y: {
                 type: 'number',
                 description:
-                  '[mouse_button, mouse_motion] Y position in viewport pixels (0,0 = top-left)',
+                  '[mouse_button, mouse_motion] Y position in viewport pixels (0,0 = top-left): the space of get_ui_elements rects and take_screenshot pixels. Converted to window pixels when a stretch mode scales or letterboxes the viewport.',
               },
               relative_x: {
                 type: 'number',
-                description: '[mouse_motion] Relative X movement in pixels',
+                description: '[mouse_motion] Relative X movement in viewport pixels',
               },
               relative_y: {
                 type: 'number',
-                description: '[mouse_motion] Relative Y movement in pixels',
+                description: '[mouse_motion] Relative Y movement in viewport pixels',
               },
               double_click: {
                 type: 'boolean',
@@ -370,11 +466,16 @@ export const runtimeToolDefinitions = [
   {
     name: 'get_ui_elements',
     description:
-      'Walk the running scene tree and return all Control nodes with positions, sizes, types, and text content. Always call this before simulate_input click_element actions to discover valid element names and paths. Requires an active runtime session (run_project or attach_project). visibleOnly defaults true; pass false to include hidden Controls. filter narrows by class. Returns: elements[] with path/type/rect/visible plus optional text/disabled/tooltip.',
+      "Walk the running scene tree and return all Control nodes with positions, sizes, types, and text content. Always call this before simulate_input click_element actions to discover valid element names and paths. Requires an active runtime session (run_project or attach_project). visibleOnly defaults true; pass false to include hidden Controls. filter narrows by class. Rects are in root-viewport pixels (the space of take_screenshot and simulate_input x/y) through CanvasLayers, SubViewportContainers and embedded Windows, as the bounds of the four transformed corners. A Control in a viewport that nothing on screen displays has mapped: false and a rect in that viewport's own pixels; click_element refuses it. Returns: elements[] with path/type/rect/visible plus optional text/disabled/tooltip/mapped.",
     annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         visibleOnly: {
           type: 'boolean',
           description:
@@ -412,6 +513,7 @@ export const runtimeToolDefinitions = [
               placeholder: { type: 'string' },
               disabled: { type: 'boolean' },
               tooltip: { type: 'string' },
+              mapped: { type: 'boolean' },
             },
           },
         },
@@ -428,6 +530,11 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         script: {
           type: 'string',
           description:
@@ -759,7 +866,7 @@ export async function handleRunProject(
   if (!scene.ok) return scene;
 
   if (scene.value !== undefined) {
-    if (!validateSubPath(projectPath, scene.value)) {
+    if (scene.value.includes('\0') || !validateSubPath(projectPath, scene.value)) {
       return err(
         createErrorResponse(
           `Invalid scene path: must be project-relative without ".." (got: ${scene.value})`,
@@ -767,6 +874,42 @@ export async function handleRunProject(
         ),
       );
     }
+  }
+
+  // Validated before the pre-flight scan and the confirmation prompt, so a malformed call never
+  // asks the user anything. spawn would throw on a NUL byte; refuse it here with a clear message.
+  const userArgs = optionalStringArray(args, 'userArgs');
+  if (!userArgs.ok) return userArgs;
+  // Refused before the pre-flight scan and the confirmation prompt, like userArgs.
+  const maxFps = optionalNumber(args, 'maxFps');
+  if (!maxFps.ok) return maxFps;
+  if (
+    maxFps.value !== undefined &&
+    (!Number.isInteger(maxFps.value) || maxFps.value < 0 || maxFps.value > 1000)
+  ) {
+    return err(
+      createErrorResponse('Invalid maxFps: an integer from 0 to 1000 is required (0 = uncapped)', [
+        'Omit maxFps to use the server setting',
+      ]),
+    );
+  }
+  const audio = optionalBoolean(args, 'audio');
+  if (!audio.ok) return audio;
+  const idleStop = optionalNumber(args, 'idleStopMinutes');
+  if (!idleStop.ok) return idleStop;
+  if (idleStop.value !== undefined && (!Number.isFinite(idleStop.value) || idleStop.value < 0)) {
+    return err(
+      createErrorResponse('Invalid idleStopMinutes: a non-negative finite number is required', [
+        'Pass 0 to disable idle stop, or omit it to use the server setting',
+      ]),
+    );
+  }
+  if (userArgs.value?.some((a) => a.includes('\0'))) {
+    return err(
+      createErrorResponse('Invalid userArgs: an entry contains a NUL byte', [
+        'Pass each argument as a plain string without NUL characters',
+      ]),
+    );
   }
 
   // Pre-flight security scan: autoloads + the launched scene's scripts,
@@ -962,12 +1105,39 @@ export async function handleRunProject(
   if (!profiling.ok) return profiling;
   const isProfiling = profiling.value === true;
 
+  // Engine options. A background run takes the server's frame cap and, unless the
+  // caller has to hear the game, its silent audio driver. maxFps never controls audio.
+  const engine: EngineLaunchOptions = {};
+  const cfg = ctx.serverConfig;
+  if (maxFps.value !== undefined) {
+    engine.maxFps = maxFps.value;
+  } else if (isBackground && cfg && cfg.backgroundMaxFps > 0) {
+    engine.maxFps = cfg.backgroundMaxFps;
+  }
+  if (isBackground && audio.value !== true && cfg && cfg.backgroundAudioDriver) {
+    engine.audioDriver = cfg.backgroundAudioDriver;
+  }
   try {
-    await runner.runProject(projectPath, scene.value, isBackground, bridgePort.value, isProfiling);
+    const refusal = ctx.sessions?.prepareLaunch?.(projectPath);
+    if (refusal) {
+      const [first = '', ...rest] = refusal.split('\n');
+      return err(createErrorResponse(first, rest));
+    }
+    await runner.runProject(
+      projectPath,
+      scene.value,
+      isBackground,
+      bridgePort.value,
+      isProfiling,
+      userArgs.value ?? [],
+      engine,
+    );
+    ctx.sessions?.setNoIdleStop(projectPath, idleStop.value === 0);
 
     const bridgeResult = await runner.waitForBridge();
 
     if (!bridgeResult.ready) {
+      ctx.sessions?.markStopping?.(projectPath, 'launch_failed');
       if (runner.activeProcess && runner.activeProcess.hasExited) {
         // Tear down the spawned-mode session state so a retry of run_project
         // works without an intervening stop_project.
@@ -1840,4 +2010,48 @@ export async function handleRunScript(
       ]),
     );
   }
+}
+
+export async function handleGetServerInfo(
+  _runner: GodotRunner,
+  _args: OperationParams,
+  ctx: McpContext = createNullContext(),
+): Promise<HandlerResult> {
+  if (!ctx.serverIdentity || !ctx.serverConfig || !ctx.sessions) {
+    return err(
+      createErrorResponse('Server identity is unavailable outside a running MCP server context.', [
+        'Connect to the server over stdio and call get_server_info without projectPath.',
+      ]),
+    );
+  }
+  const { sessions } = ctx.sessions.list();
+  const state = (session: unknown) =>
+    session && typeof session === 'object' && 'state' in session ? session.state : null;
+  return createStructuredResponse({
+    version: ctx.serverIdentity.version,
+    releasePath: ctx.serverIdentity.releasePath,
+    requireProjectPath: ctx.serverConfig.requireProjectPath,
+    maxGames: ctx.serverConfig.maxGames,
+    backgroundMaxFps: ctx.serverConfig.backgroundMaxFps,
+    backgroundAudioDriver: ctx.serverConfig.backgroundAudioDriver,
+    idleStopMinutes: ctx.serverConfig.idleStopMinutes,
+    live: sessions.filter((session) => state(session) === 'live').length,
+    launching: sessions.filter((session) => state(session) === 'launching').length,
+  });
+}
+
+export async function handleListSessions(
+  _runner: GodotRunner,
+  _args: OperationParams,
+  ctx: McpContext = createNullContext(),
+): Promise<HandlerResult> {
+  if (!ctx.sessions) {
+    return createStructuredResponse({
+      sessions: [],
+      recentlyEnded: [],
+      limits: null,
+      note: 'This server holds one implicit session and has no session pool.',
+    });
+  }
+  return createStructuredResponse({ ...ctx.sessions.list() });
 }

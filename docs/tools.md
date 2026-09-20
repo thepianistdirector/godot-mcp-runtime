@@ -2,29 +2,75 @@
 
 The full MCP tool reference for Godot MCP Runtime. This file always reflects `main`; for older releases, browse the corresponding git tag.
 
+## Runtime sessions in this fork
+
+Each canonical `projectPath` owns one runner, bridge, process, output buffer and profiler. Pass the same absolute `projectPath` to every runtime and profiler call, including `stop_project`. Symlink, relative and on-disk case aliases resolve to the same project. Conflicting `projectPath` and `project_path` values are refused, as are explicitly supplied null, nonstring, blank or NUL-containing values in either spelling. Only an omitted path can use implicit routing. A path naming no session never borrows another project's game.
+
+A second `run_project` for the same project replaces only that project's game. Argument and security checks finish before launch admission can stop anything. Lifecycle calls on one path queue in order, including a stop submitted immediately behind a launch; calls to different projects can overlap. A failed launch releases its reservation and cleans up only the child created by that attempt. Processes are recorded at spawn, before bridge readiness.
+
+Replacement waits for the old child to exit before transferring its bridge or spawning a successor. After bridge shutdown, it waits up to two seconds each for SIGTERM and SIGKILL. If exit is still unconfirmed, the call fails, retains ownership and starts no successor; retry `stop_project`. Attached external games must be detached and stopped by their owner. An injection, profiler or spawn failure before a child exists clears the abandoned launch state for retry.
+
+A child-process error after a successful spawn, including a failed signal, is reported without marking that child as exited or removing its ownership. Only a spawn failure with no PID or a real exit ends that process. Automatic idle-stop refusals are logged on stderr, preserve ownership and continue cleanup of other idle sessions. Periodic sweeps do not overlap; a still-idle failed session is retried on the next sweep. Explicit stop calls retain their refusal diagnostic.
+
+Automatic bridge-port selection checks active ports and recent reservations. If the initial candidate and 20 retries are all reserved, launch fails with an allocation diagnostic and starts no successor. Retry after a fresh port becomes available.
+
+`get_server_info` is read-only and needs neither a project path nor a running game. It reports the actual server's package `version`, symlink-resolved `releasePath`, effective `requireProjectPath`, `maxGames`, `backgroundMaxFps`, `backgroundAudioDriver`, `idleStopMinutes`, and current `live` and `launching` session counts. Counts describe this server; `maxGames` is the host cap. File settings and environment overrides are already resolved. The response contains only these fields, without environment variables, tokens or credentials.
+
+`list_sessions` is read-only. It returns `sessions`, `recentlyEnded` and `limits`. Sessions identify the path, mode (`spawned` or `attached`), state (`launching`, `live` or `exited`), PID, bridge port, profiler, start, idle duration and last command times. History keeps the last 20 process endings, each with PID and OS start identity, reason (`stopped`, `idle_stop`, `replaced`, `exited`, `launch_failed`, `server_shutdown`), exit code and time. A launch failure before a child exists has a null PID. A retained exited record is not a live session.
+
+When `requireProjectPath` is false, an omitted path can select the sole live session; two or more sessions require an explicit path. When it is true, every session call needs a path regardless of session count. Headless scene editing remains blocked only by a runtime on that same project.
+
+`run_project` launch options:
+
+- `background: true` parks the window and blocks physical input while preserving programmatic input and captures. Background defaults may cap frames and silence audio.
+- `maxFps` is an integer from 0 to 1000; 0 means uncapped. It overrides the background frame cap and also works on a visible run. It does not control audio.
+- `audio: true` preserves the normal audio driver even on a background run. Use it for sound review. A driver name or an internal bus capture alone does not prove system output.
+- `idleStopMinutes: 0` exempts this session from idle cleanup. Omission (or a positive value) restores the server setting for each new session, including replacement. Idle time starts when the last command completes; an in-flight command is never idle.
+- `userArgs` stays after a standalone `--` and cannot become engine options. `bridgePort`, `scene` and `profiling` retain their existing meanings.
+
+## Multi-game server configuration
+
+The server reads `<package-root>/godot-mcp.config.json`, or the file named by `GODOT_MCP_CONFIG`. The environment overrides file values. Missing settings preserve upstream behavior. Invalid settings are diagnosed on stderr and ignored; security switches cannot be configured through this file.
+
+Only the five listed own keys are accepted. Unknown keys, including JavaScript prototype names such as `constructor`, `toString` and `__proto__`, are warned and ignored while valid settings continue to load.
+
+| Setting                 | Environment override                | Default               |
+| ----------------------- | ----------------------------------- | --------------------- |
+| `requireProjectPath`    | `GODOT_MCP_REQUIRE_PROJECT_PATH`    | `false`               |
+| `maxGames`              | `GODOT_MCP_MAX_GAMES`               | `0` (no cap)          |
+| `backgroundMaxFps`      | `GODOT_MCP_BACKGROUND_MAX_FPS`      | `0` (no cap)          |
+| `backgroundAudioDriver` | `GODOT_MCP_BACKGROUND_AUDIO_DRIVER` | empty (normal driver) |
+| `idleStopMinutes`       | `GODOT_MCP_IDLE_STOP_MINUTES`       | `0` (disabled)        |
+
+`GODOT_MCP_STATE_DIR` selects the ownership-record directory (default `<package-root>/state`). Each record contains the game PID and OS start time, canonical path, server PID and server start time. Shutdown removes only records belonging to children this pool actually spawned, matching both identities. An observer pool cannot remove another server's record.
+
+Admission counts host Godot games plus this server's pending launches. At the cap it refuses immediately; it never waits while holding a project mutex. A process-table inspection failure refuses admission and reports `limits.gamesOnHost: null` with `processInspectionError`, never a false zero. The host cap is soft across different servers starting simultaneously. Windows process inspection is unavailable, so this fork refuses pooled launches there until an inspector is provided; this Mac fork does not claim Windows multi-game support.
+
+Ownership records are matched against the raw PID/start table before token classification, so a folder containing `-e` cannot hide a recorded game. Unrecorded process parsing reads engine arguments only before `--`, excludes headless, editor and project-manager processes (`-e`, `--editor`, `-p`, `--project-manager`), and stops the parsed path at the first short or long option. Spaces inside a path are retained. Because `ps` loses argument boundaries, admission also inspects flags after `--path` and refuses ambiguous matches to the requested project; unrelated excluded processes do not consume game capacity. A foreign live game is refused. Automatic orphan cleanup requires a matching ownership record whose server has exited, and a fresh process table confirming the old identity is gone after termination. Otherwise it refuses the new launch while retaining the record for retry.
+
 ## Project Management
 
-| Tool               | Description                                                                                                                                                                                                                              |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `launch_editor`    | Open the Godot editor GUI for a project                                                                                                                                                                                                  |
-| `run_project`      | Run a project and inject the MCP bridge. Pass `background: true` to hide the window; `profiling: true` to enable the profiling tools; pass `bridgePort` (integer 1–65535) to pin the bridge port - auto-selects a free port when omitted |
-| `attach_project`   | Inject the MCP bridge for a project you'll launch yourself. Pass `bridgePort` (integer 1–65535) to pin a specific port - auto-selects a free port when omitted                                                                           |
-| `detach_project`   | Remove the injected bridge after manual-launch use, leaving the external process alone. Mostly optional: a disconnected bridge ends the attached session on the next tool call, and calling this afterwards succeeds idempotently        |
-| `stop_project`     | Stop the running project and remove the bridge (also detaches attached-mode state). Call it even if you closed the Godot window yourself - it frees the retained process slot and reports `alreadyExited` with the logs captured then    |
-| `get_debug_output` | Read stdout/stderr from an MCP-spawned project, including after it exits or crashes (unavailable in attached mode)                                                                                                                       |
-| `list_projects`    | Find Godot projects in a directory                                                                                                                                                                                                       |
-| `get_project_info` | Get project metadata and Godot version                                                                                                                                                                                                   |
+| Tool               | Description                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `launch_editor`    | Open the Godot editor GUI for a project                                                                                                                                                                                                                                                                                                                                                |
+| `run_project`      | Run a project and inject the MCP bridge. Pass `background: true` to hide the window; `profiling: true` to enable the profiling tools; pass `bridgePort` (integer 1–65535) to pin the bridge port - auto-selects a free port when omitted; pass `userArgs` (array of strings) for the game's own arguments, appended after a standalone `--` and read with `OS.get_cmdline_user_args()` |
+| `attach_project`   | Inject the MCP bridge for a project you'll launch yourself. Pass `bridgePort` (integer 1–65535) to pin a specific port - auto-selects a free port when omitted                                                                                                                                                                                                                         |
+| `detach_project`   | Remove the injected bridge after manual-launch use, leaving the external process alone. Mostly optional: a disconnected bridge ends the attached session on the next tool call, and calling this afterwards succeeds idempotently                                                                                                                                                      |
+| `stop_project`     | Stop the running project and remove the bridge (also detaches attached-mode state). Call it even if you closed the Godot window yourself - it frees the retained process slot and reports `alreadyExited` with the logs captured then                                                                                                                                                  |
+| `get_debug_output` | Read stdout/stderr from an MCP-spawned project, including after it exits or crashes (unavailable in attached mode)                                                                                                                                                                                                                                                                     |
+| `list_projects`    | Find Godot projects in a directory                                                                                                                                                                                                                                                                                                                                                     |
+| `get_project_info` | Get project metadata and Godot version                                                                                                                                                                                                                                                                                                                                                 |
 
 ## Runtime (requires `run_project` or `attach_project` first)
 
 Both `run_project` and `attach_project` wait for the bridge before returning success, so runtime tools are usable immediately after the call returns. `attach_project` waits up to 15 s for the externally launched Godot process to come up. If you (the agent) are launching Godot yourself, kick the launch off in parallel with `attach_project` so the wait absorbs Godot's startup - don't sequentialize. If a human is launching Godot and they don't make it inside the window, retry `attach_project` (`bridge.inject` is idempotent). Both `run_project` and `attach_project` auto-select a free bridge port when `bridgePort` is omitted; pass `bridgePort` to pin a specific port.
 
-| Tool              | Description                                                                                                                             |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `take_screenshot` | Capture a PNG; defaults to a 960x540 inline preview. Use `responseMode: "full"` for pixel-perfect, `"path_only"` for path metadata only |
-| `simulate_input`  | Send batched input: key, mouse_button, mouse_motion, click_element, action, wait                                                        |
-| `get_ui_elements` | Get all visible Control nodes with positions, types, and text                                                                           |
-| `run_script`      | Execute arbitrary GDScript at runtime with full SceneTree access                                                                        |
+| Tool              | Description                                                                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `take_screenshot` | Capture a PNG; defaults to a 960x540 inline preview. Use `responseMode: "full"` for pixel-perfect, `"path_only"` for path metadata only  |
+| `simulate_input`  | Send batched input: key, mouse_button, mouse_motion, click_element, action, wait                                                         |
+| `get_ui_elements` | Get all visible Control nodes with positions (root-viewport pixels, through SubViewportContainers and embedded Windows), types, and text |
+| `run_script`      | Execute arbitrary GDScript at runtime with full SceneTree access                                                                         |
 
 `take_screenshot` defaults to `responseMode: "preview"` - the full PNG is saved to `.mcp/godot-runtime/screenshots/` and a 960x540-bounded preview is returned inline. Use `"full"` for pixel-level inspection or `"path_only"` to skip the inline image.
 

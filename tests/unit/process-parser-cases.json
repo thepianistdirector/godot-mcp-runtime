@@ -1,0 +1,16 @@
+[
+  { "name": "short debug flag", "args": "--path /w/A -d", "path": "/w/A" },
+  { "name": "short script flag", "args": "--path /w/A -s res://main.gd", "path": "/w/A" },
+  { "name": "repeated spaces", "args": "--path /w/A  B --max-fps 60", "path": "/w/A  B" },
+  { "name": "ordinary space", "args": "--path /w/A B --max-fps 60", "path": "/w/A B" },
+  { "name": "manager long", "args": "--project-manager --path /w/A", "path": null },
+  { "name": "manager short", "args": "--path /w/A -p", "path": null },
+  { "name": "editor long", "args": "--editor --path /w/A", "path": null },
+  { "name": "editor short", "args": "--path /w/A -e", "path": null },
+  { "name": "headless", "args": "--headless --path /w/A --import", "path": null },
+  { "name": "user flags", "args": "--path /w/A -- --headless --path /w/B -e -p", "path": "/w/A" },
+  { "name": "scene", "args": "--path /w/A res://main.tscn --max-fps 60", "path": "/w/A" },
+  { "name": "empty path", "args": "--path --max-fps 60", "path": null },
+  { "name": "default manager", "args": "", "path": null },
+  { "name": "prefix sibling", "args": "--path /w/A10", "path": "/w/A10" }
+]

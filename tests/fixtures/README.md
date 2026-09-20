@@ -15,6 +15,15 @@ The same shape, with a `_process` loop that burns measurable time (`hot_loop.gd:
 `integration/profiler-smoke.test.ts` launches it with `profiling: true` and expects that
 function to come back at the top of the capture. Import it as `profilingFixtureProjectPath`.
 
+## `godot-input-project/`
+
+A 640x360 viewport stretched into a 1280x720 window (integer scale), like a pixel-art game. Its
+`main.gd` builds a root button, buttons inside a 1:1 and a 2x-shrunk SubViewportContainer, a rotated
+Control, a button in an embedded Window and one in a SubViewport nothing displays, and records every
+mouse event's position and `button_mask` (`state()`, `reset()` through `run_script`). The comment at
+the top of `main.gd` lists where each Control sits in root-viewport pixels.
+`integration/input-and-embedding.test.ts` uses it. Import it as `inputFixtureProjectPath`.
+
 Use it from tests by importing the path helper:
 
 ```ts

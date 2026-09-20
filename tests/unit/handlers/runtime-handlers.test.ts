@@ -26,6 +26,7 @@ import {
   handleRunProject,
   handleAttachProject,
   handleLaunchEditor,
+  runtimeToolDefinitions,
 } from '../../../src/tools/runtime-tools.js';
 import { fixtureProjectPath } from '../../helpers/fixture-paths.js';
 import { auditScriptsDir, screenshotsDir } from '../../../src/utils/artifact-paths.js';
@@ -93,6 +94,8 @@ interface BridgeCall {
 interface RuntimeFake {
   asRunner: GodotRunner;
   bridgeCalls: BridgeCall[];
+  /** Arguments of every runProject call, in order. */
+  runProjectCalls: unknown[][];
   /** Number of times stopProject() has been invoked. */
   stopCalls(): number;
   setSession(opts: {
@@ -118,6 +121,7 @@ interface RuntimeFake {
 
 function createRuntimeFake(): RuntimeFake {
   const bridgeCalls: BridgeCall[] = [];
+  const runProjectCalls: unknown[][] = [];
   let bridgeResponse = '{}';
   let bridgeRuntimeErrors: string[] = [];
   let stopResult: RuntimeStopResult | null = {
@@ -196,7 +200,10 @@ function createRuntimeFake(): RuntimeFake {
       _scene?: string,
       _background?: boolean,
       bridgePort?: number,
+      _profiling?: boolean,
+      _userArgs?: string[],
     ) {
+      runProjectCalls.push([projectPath, _scene, _background, bridgePort, _profiling, _userArgs]);
       if (runProjectError) throw runProjectError;
       state.activeSessionMode = 'spawned';
       state.activeProjectPath = projectPath;
@@ -226,6 +233,7 @@ function createRuntimeFake(): RuntimeFake {
   return {
     asRunner: fake as unknown as GodotRunner,
     bridgeCalls,
+    runProjectCalls,
     stopCalls() {
       return stopCallCount;
     },
@@ -380,6 +388,46 @@ describe('handleRunProject bridge port', () => {
     expect(hasError(result)).toBe(false);
     const text = unwrap(result).content[0].text;
     expect(text).toMatch(/port \d+/);
+  });
+});
+
+describe('handleRunProject userArgs', () => {
+  it('declares userArgs in the run_project schema as an array of strings', () => {
+    const def = runtimeToolDefinitions.find((t) => t.name === 'run_project');
+    const props = def?.inputSchema.properties as Record<string, unknown>;
+    expect(props.userArgs).toMatchObject({ type: 'array', items: { type: 'string' } });
+  });
+
+  it.each([
+    ['userArgs', ['--save-root=/tmp/a b', "it's", '$(echo pwned)', '--new']],
+    ['user_args', ['--continue']],
+  ])('passes %s to the runner exactly as given', async (key, userArgs) => {
+    const fake = createRuntimeFake();
+    fake.setGodotPath('/usr/bin/godot');
+    const result = await handleRunProject(
+      fake.asRunner,
+      { projectPath: fixtureProjectPath, [key]: userArgs },
+      acceptingContext(),
+    );
+    expect(hasError(result)).toBe(false);
+    expect(fake.runProjectCalls[0]?.[5]).toEqual(userArgs);
+  });
+
+  it.each([
+    ['a string', '--new'],
+    ['an object', { save_root: '/tmp' }],
+    ['a non-string entry', ['--new', 3]],
+    ['an entry with a NUL byte', ['--save-root=/tmp/a b']],
+  ])('rejects userArgs that is %s, before launching', async (_label, userArgs) => {
+    const fake = createRuntimeFake();
+    fake.setGodotPath('/usr/bin/godot');
+    const result = await handleRunProject(
+      fake.asRunner,
+      { projectPath: fixtureProjectPath, userArgs },
+      acceptingContext(),
+    );
+    expectErrorMatching(result, /userArgs/);
+    expect(fake.runProjectCalls).toEqual([]);
   });
 });
 

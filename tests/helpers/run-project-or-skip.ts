@@ -22,6 +22,8 @@ export interface RunProjectOrSkipOptions {
   background?: boolean;
   bridgePort?: number;
   profiling?: boolean;
+  /** Command-line arguments for the game, appended after a standalone `--`. */
+  userArgs?: string[];
   /** Passed to waitForBridge. Default: 20000ms. */
   waitMs?: number;
 }
@@ -44,6 +46,7 @@ export async function runProjectOrSkip(
     opts.background ?? false,
     opts.bridgePort,
     opts.profiling ?? false,
+    opts.userArgs ?? [],
   );
   const bridgeResult = await runner.waitForBridge(opts.waitMs ?? DEFAULT_BRIDGE_WAIT_MS);
 

@@ -55,6 +55,8 @@ export interface GodotProcess {
   totalErrorsWritten: number;
   exitCode: number | null;
   hasExited: boolean;
+  /** A shutdown request was sent for this exact child; retained across a failed bounded stop. */
+  terminationRequested?: boolean;
   sessionToken: string;
 }
 
@@ -78,6 +80,22 @@ export interface RuntimeStopResult {
 export interface GodotServerConfig {
   godotPath?: string;
   debugMode?: boolean;
+  /**
+   * Where a bridge port comes from when the caller gives none. Defaults to
+   * `findFreePort`. A RunnerPool passes its own allocator so two runners in one
+   * server never hand out the same port inside the bind window.
+   */
+  allocatePort?: () => Promise<number>;
+  /** Pool ownership publication, immediately after a child is spawned (before bridge polling). */
+  onSpawn?: (proc: GodotProcess) => void;
+}
+
+/** Engine options `runProject` adds before the `--` separator. */
+export interface EngineLaunchOptions {
+  /** `--max-fps <n>`; 0 or undefined adds nothing. */
+  maxFps?: number;
+  /** `--audio-driver <name>`; empty or undefined adds nothing. */
+  audioDriver?: string;
 }
 
 export interface OperationResult {
@@ -159,8 +177,12 @@ export class GodotRunner {
   private rxChunks: Buffer[] = [];
   private rxTotal = 0;
   private inFlight: InFlightCommand | null = null;
+  private allocatePort: () => Promise<number>;
+  private readonly onSpawn: GodotServerConfig['onSpawn'];
 
   constructor(config?: GodotServerConfig) {
+    this.allocatePort = config?.allocatePort ?? findFreePort;
+    this.onSpawn = config?.onSpawn;
     this.operationsScriptPath = join(__dirname, '..', 'scripts', 'godot_operations.gd');
     const bridgeScriptPath = join(__dirname, '..', 'scripts', 'mcp_bridge.gd');
     this.bridge = new BridgeManager(bridgeScriptPath);
@@ -438,6 +460,8 @@ export class GodotRunner {
     background: boolean = false,
     bridgePort?: number,
     profiling: boolean = false,
+    userArgs: readonly string[] = [],
+    engine: EngineLaunchOptions = {},
   ): Promise<GodotProcess> {
     if (!this.godotPath) {
       throw new Error(
@@ -449,26 +473,7 @@ export class GodotRunner {
     // The bridge reports an absolute project_path in its pong, so a relative
     // expectedPath makes pollBridge's path guard fail immediately and mask
     // the real reason as a generic bridge timeout.
-    const epoch = this.beginSessionTransition();
     projectPath = resolve(projectPath);
-    this.closeProfiler();
-
-    if (this.activeSessionMode === 'spawned' && this.activeProcess) {
-      logDebug('Killing existing Godot process before starting a new one');
-      this.closeConnection();
-      this.activeProcess.process.kill();
-      if (this.activeProjectPath && this.activeProjectPath !== projectPath) {
-        this.bridge.cleanup(this.activeProjectPath);
-      }
-    } else if (
-      this.activeSessionMode === 'attached' &&
-      this.activeProjectPath &&
-      this.activeProjectPath !== projectPath
-    ) {
-      this.closeConnection();
-      this.bridge.cleanup(this.activeProjectPath);
-    }
-
     if (!checkDisplayAvailable()) {
       throw new Error(
         'No display server available (DISPLAY and WAYLAND_DISPLAY are both unset). ' +
@@ -476,110 +481,161 @@ export class GodotRunner {
       );
     }
 
-    const port = bridgePort ?? (await findFreePort());
-    this.activeBridgePort = port;
+    if (this.activeSessionMode === 'attached') {
+      throw new Error(
+        'This runner is attached to an external game. Detach it and stop that game yourself before run_project.',
+      );
+    }
+    // Do not transfer the epoch or bridge while the previous child can still run.
+    if (this.activeProcess) await this.stopProject();
+    const epoch = this.beginSessionTransition();
+    this.closeProfiler();
 
     try {
-      this.bridge.inject(projectPath, port);
-    } catch (err) {
-      // A name collision with a user's own McpBridge autoload is the one
-      // inject failure the caller can act on, and swallowing it would surface
-      // as a generic bridge timeout minutes later. Everything else (an
-      // unwritable project directory, a packaging problem in the shipped
-      // template) still degrades to a bridgeless run, as before.
-      if (err instanceof BridgeAutoloadCollisionError) throw err;
-      logDebug(`Non-fatal: Failed to inject bridge autoload: ${err}`);
-    }
-    this.activeProjectPath = projectPath;
-    this.activeSessionMode = 'spawned';
+      const port = bridgePort ?? (await this.allocatePort());
+      this.activeBridgePort = port;
 
-    const cmdArgs = ['--path', projectPath];
-    if (profiling) {
-      this.activeProfiler = await DebuggerProfiler.create();
-      cmdArgs.push('--remote-debug', `tcp://127.0.0.1:${this.activeProfiler.port}`);
-      logDebug(`Profiling enabled (debugger port ${this.activeProfiler.port})`);
-    }
-    if (scene && validateSubPath(projectPath, scene)) {
-      logDebug(`Adding scene parameter: ${scene}`);
-      cmdArgs.push(scene);
-    }
+      try {
+        this.bridge.inject(projectPath, port);
+      } catch (err) {
+        // A name collision with a user's own McpBridge autoload is the one
+        // inject failure the caller can act on, and swallowing it would surface
+        // as a generic bridge timeout minutes later. Everything else (an
+        // unwritable project directory, a packaging problem in the shipped
+        // template) still degrades to a bridgeless run, as before.
+        if (err instanceof BridgeAutoloadCollisionError) throw err;
+        logDebug(`Non-fatal: Failed to inject bridge autoload: ${err}`);
+      }
+      this.activeProjectPath = projectPath;
+      this.activeSessionMode = 'spawned';
 
-    const portSource = bridgePort !== undefined ? 'explicit' : 'auto';
-    logDebug(`Running Godot project: ${projectPath} (bridge port ${port}, ${portSource})`);
-    const sessionToken = randomBytes(16).toString('hex');
-    this.activeSessionToken = sessionToken;
-    const spawnOptions: SpawnOptions = {
-      stdio: 'pipe',
-      env: {
-        ...process.env,
-        MCP_SESSION_TOKEN: sessionToken,
-      },
-    };
-    if (background) {
-      spawnOptions.env = { ...spawnOptions.env, MCP_BACKGROUND: '1' };
-    }
-    let proc;
-    try {
-      proc = spawn(this.godotPath, cmdArgs, spawnOptions);
-    } catch (err) {
-      // Nothing will dial the debugger listener now; don't strand the port.
-      this.closeProfiler();
-      throw err;
-    }
-    const output: string[] = [];
-    const errors: string[] = [];
+      const cmdArgs = ['--path', projectPath];
+      if (profiling) {
+        this.activeProfiler = await DebuggerProfiler.create();
+        cmdArgs.push('--remote-debug', `tcp://127.0.0.1:${this.activeProfiler.port}`);
+        logDebug(`Profiling enabled (debugger port ${this.activeProfiler.port})`);
+      }
+      if (scene && validateSubPath(projectPath, scene)) {
+        logDebug(`Adding scene parameter: ${scene}`);
+        cmdArgs.push(scene);
+      }
+      // Engine options stay before the `--`: after it Godot would hand them to the game.
+      if (engine.maxFps !== undefined && engine.maxFps > 0) {
+        cmdArgs.push('--max-fps', String(engine.maxFps));
+      }
+      if (engine.audioDriver) {
+        cmdArgs.push('--audio-driver', engine.audioDriver);
+      }
+      // The game's own arguments go last, after a standalone `--`. Godot parses nothing after it and
+      // hands it all to OS.get_cmdline_user_args(), so a user arg can never act as an engine option
+      // (--path, --script). spawn passes each entry as one argv element, never through a shell.
+      if (userArgs.length > 0) {
+        logDebug(`Adding ${userArgs.length} user argument(s) after --`);
+        cmdArgs.push('--', ...userArgs);
+      }
 
-    const godotProcess: GodotProcess = {
-      process: proc,
-      output,
-      errors,
-      totalErrorsWritten: 0,
-      exitCode: null,
-      hasExited: false,
-      sessionToken,
-    };
+      const portSource = bridgePort !== undefined ? 'explicit' : 'auto';
+      logDebug(`Running Godot project: ${projectPath} (bridge port ${port}, ${portSource})`);
+      const sessionToken = randomBytes(16).toString('hex');
+      this.activeSessionToken = sessionToken;
+      const spawnOptions: SpawnOptions = {
+        stdio: 'pipe',
+        env: {
+          ...process.env,
+          MCP_SESSION_TOKEN: sessionToken,
+        },
+      };
+      if (background) {
+        spawnOptions.env = { ...spawnOptions.env, MCP_BACKGROUND: '1' };
+      }
+      let proc;
+      try {
+        proc = spawn(this.godotPath, cmdArgs, spawnOptions);
+      } catch (err) {
+        // Nothing will dial the debugger listener now; don't strand the port.
+        this.closeProfiler();
+        throw err;
+      }
+      const output: string[] = [];
+      const errors: string[] = [];
 
-    proc.stdout?.on('data', (data: Buffer) => {
-      const lines = data.toString().split('\n');
-      output.push(...lines);
-      if (output.length > 500) output.splice(0, output.length - 500);
-      lines.forEach((line: string) => {
-        if (line.trim()) logDebug(`[Godot stdout] ${line}`);
+      const godotProcess: GodotProcess = {
+        process: proc,
+        output,
+        errors,
+        totalErrorsWritten: 0,
+        exitCode: null,
+        hasExited: false,
+        sessionToken,
+      };
+
+      proc.stdout?.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n');
+        output.push(...lines);
+        if (output.length > 500) output.splice(0, output.length - 500);
+        lines.forEach((line: string) => {
+          if (line.trim()) logDebug(`[Godot stdout] ${line}`);
+        });
       });
-    });
 
-    proc.stderr?.on('data', (data: Buffer) => {
-      const lines = data.toString().split('\n');
-      godotProcess.totalErrorsWritten += lines.length;
-      errors.push(...lines);
-      if (errors.length > 500) errors.splice(0, errors.length - 500);
-      lines.forEach((line: string) => {
-        if (line.trim()) logDebug(`[Godot stderr] ${line}`);
+      proc.stderr?.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n');
+        godotProcess.totalErrorsWritten += lines.length;
+        errors.push(...lines);
+        if (errors.length > 500) errors.splice(0, errors.length - 500);
+        lines.forEach((line: string) => {
+          if (line.trim()) logDebug(`[Godot stderr] ${line}`);
+        });
       });
-    });
 
-    const exitProjectPath = projectPath;
-    proc.on('exit', (code: number | null) => {
-      this.handleSpawnedProcessExit(godotProcess, exitProjectPath, epoch, code);
-    });
+      const exitProjectPath = projectPath;
+      proc.on('exit', (code: number | null) => {
+        this.handleSpawnedProcessExit(godotProcess, exitProjectPath, epoch, code);
+      });
 
-    proc.on('error', (err: Error) => {
-      console.error('Failed to start Godot process:', err);
-      errors.push(`Process error: ${err.message}`);
-      godotProcess.hasExited = true;
-      // The engine will never dial back, so nothing can arrive on the debugger
-      // listener. Holding the port open until the next run_project is pointless.
-      this.closeProfiler();
-    });
+      proc.on('error', (err: Error) => {
+        console.error('Godot child process error:', err);
+        errors.push(`Process error: ${err.message}`);
+        // A failed spawn has no PID. Once a child exists, errors also report
+        // failed signals/IPC and do not prove exit; retain its live ownership.
+        if (proc.pid === undefined) {
+          godotProcess.hasExited = true;
+          // Nothing can dial the debugger for a failed spawn. A delayed old
+          // error must not close the profiler of a newer session.
+          if (this.sessionEpoch === epoch) this.closeProfiler();
+        }
+      });
 
-    this.activeProcess = godotProcess;
-    return this.activeProcess;
+      this.activeProcess = godotProcess;
+      if (this.onSpawn) {
+        if (proc.pid !== undefined) this.onSpawn(godotProcess);
+        else proc.once('spawn', () => this.onSpawn?.(godotProcess));
+      }
+      return this.activeProcess;
+    } catch (error) {
+      // No child owns this attempt yet. Roll back injection/profiler/spawn
+      // failures so a retry sees an empty runner, including its bridge port.
+      if (!this.activeProcess) {
+        this.closeConnection();
+        this.closeProfiler();
+        try {
+          this.bridge.cleanup(projectPath);
+        } catch (cleanupError) {
+          logDebug(`Bridge cleanup after failed launch: ${String(cleanupError)}`);
+        }
+        this.activeSessionMode = null;
+        this.activeProjectPath = null;
+        this.activeBridgePort = null;
+        this.activeSessionToken = null;
+      }
+      throw error;
+    }
   }
 
   /**
-   * Open a new session epoch. Called as the first statement of every entry
-   * point that installs or tears down session state, so handlers registered
-   * under a previous epoch become inert the moment the transition starts.
+   * Open a new session epoch after the previous child has exited, before
+   * installing new state. A refused stop keeps its exit handler effective;
+   * late notifications from a completed old session cannot clear a new one.
    */
   private beginSessionTransition(): number {
     this.sessionEpoch += 1;
@@ -674,7 +730,6 @@ export class GodotRunner {
   }
 
   async attachProject(projectPath: string, bridgePort?: number): Promise<void> {
-    this.beginSessionTransition();
     // Resolve relative paths for the same reason as runProject — pollBridge
     // compares against the absolute path the bridge reports.
     projectPath = resolve(projectPath);
@@ -699,7 +754,8 @@ export class GodotRunner {
       this.activeSessionMode = null;
     }
 
-    const port = bridgePort ?? (await findFreePort());
+    this.beginSessionTransition();
+    const port = bridgePort ?? (await this.allocatePort());
     this.activeBridgePort = port;
     // Attach has no env channel to a Godot process the user launched
     // themselves, so the baked script copy is the only way to deliver the
@@ -716,7 +772,8 @@ export class GodotRunner {
   }
 
   async stopProject(): Promise<RuntimeStopResult | null> {
-    this.beginSessionTransition();
+    // Keep the current epoch until exit is confirmed: a timed-out stop must
+    // still auto-clear if its child exits later.
     if (!this.activeSessionMode) {
       // Release the debugger listener before any early return. A spawn that
       // failed after the profiler bound leaves `activeProcess` null, and
@@ -780,6 +837,8 @@ export class GodotRunner {
       return null;
     }
 
+    const stopping = this.activeProcess;
+    stopping.terminationRequested = true;
     // Spawned: try graceful shutdown so the bridge releases the port,
     // then ensure the process actually exits.
     try {
@@ -791,32 +850,40 @@ export class GodotRunner {
     this.closeProfiler();
 
     logDebug('Stopping active Godot process');
-    const proc = this.activeProcess.process;
-    proc.kill();
-
-    // Wait up to BRIDGE_PROCESS_EXIT_TIMEOUT_MS for graceful exit; otherwise SIGKILL.
-    if (!this.activeProcess.hasExited) {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          try {
-            proc.kill('SIGKILL');
-          } catch {
-            // already dead
-          }
-          resolve();
-        }, BRIDGE_PROCESS_EXIT_TIMEOUT_MS);
-        proc.once('exit', () => {
+    const proc = stopping.process;
+    const signalAndWait = async (signal: NodeJS.Signals): Promise<boolean> => {
+      if (stopping.hasExited) return true;
+      return new Promise<boolean>((resolve) => {
+        const finish = (exited: boolean) => {
           clearTimeout(timer);
-          resolve();
-        });
+          proc.removeListener('exit', onExit);
+          resolve(exited);
+        };
+        const onExit = () => finish(true);
+        const timer = setTimeout(() => finish(stopping.hasExited), BRIDGE_PROCESS_EXIT_TIMEOUT_MS);
+        proc.once('exit', onExit);
+        // The ChildProcess handle and hasExited guard identify our child even
+        // if its numeric PID is reused; never signal a process-table stranger.
+        try {
+          proc.kill(signal);
+        } catch {
+          /* Retain ownership unless exit is observed. */
+        }
       });
+    };
+    if (!(await signalAndWait('SIGTERM')) && !(await signalAndWait('SIGKILL'))) {
+      throw new Error(
+        `Could not confirm exit of owned Godot pid ${String(proc.pid)} after bounded SIGTERM/SIGKILL waits. No replacement was started; ownership is retained. Retry stop_project.`,
+      );
     }
 
     const result: RuntimeStopResult = {
       mode: 'spawned',
-      output: this.activeProcess.output,
-      errors: this.activeProcess.errors,
+      output: stopping.output,
+      errors: stopping.errors,
     };
+    if (this.activeProcess !== stopping) return result;
+    this.beginSessionTransition();
     this.activeProcess = null;
 
     if (this.activeProjectPath) {
