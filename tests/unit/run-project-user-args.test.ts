@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { EventEmitter } from 'events';
 
 const { spawnMock, injectMock } = vi.hoisted(() => ({ spawnMock: vi.fn(), injectMock: vi.fn() }));
 
@@ -36,13 +37,17 @@ vi.mock('../../src/utils/bridge-manager.js', async () => ({
 import { GodotRunner } from '../../src/utils/godot-runner.js';
 
 function fakeSpawnedProcess() {
-  return {
+  const child = Object.assign(new EventEmitter(), {
     pid: 4243,
     stdout: { on: vi.fn() },
     stderr: { on: vi.fn() },
-    on: vi.fn(),
     kill: vi.fn(),
-  };
+  });
+  child.kill.mockImplementation(() => {
+    child.emit('exit', null);
+    return true;
+  });
+  return child;
 }
 
 describe('runProject userArgs', () => {

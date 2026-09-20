@@ -47,6 +47,9 @@ tests/
 
 (Add new rows here as additional test files land.)
 
+- `unit/pool-recovery.test.ts`: production dispatch, handler and runner recovery, confirmed replacement/orphan exit, ownership before process parsing, explicit invalid-path refusal, and server-info session counts. Only spawn and bridge I/O are doubled.
+- `integration/server-info.test.ts`: real private stdio discovery and server identity, effective file/environment settings, resolved release symlink, and no-project read-only inspection; requires a built `dist/`.
+
 ## Running
 
 ```

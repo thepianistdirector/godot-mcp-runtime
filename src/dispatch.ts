@@ -32,6 +32,7 @@ import {
   handleGetUiElements,
   handleRunScript,
   handleListSessions,
+  handleGetServerInfo,
 } from './tools/runtime-tools.js';
 
 import {
@@ -89,6 +90,7 @@ export const toolDispatch = {
   stop_project: handleStopProject,
   list_projects: (_runner, args) => handleListProjects(args),
   list_sessions: handleListSessions,
+  get_server_info: handleGetServerInfo,
   get_project_info: handleGetProjectInfo,
   take_screenshot: handleTakeScreenshot,
   simulate_input: handleSimulateInput,

@@ -49,6 +49,7 @@ describe('outputSchema — expected coverage', () => {
     'get_debug_output',
     'get_node_signals',
     'get_scene_dependencies',
+    'get_server_info',
     'get_ui_elements',
     'list_sessions',
     'profile_project',

@@ -67,6 +67,38 @@ interface ScreenshotBridgeResponse {
 
 export const runtimeToolDefinitions = [
   {
+    name: 'get_server_info',
+    description:
+      'Inspect the actual running server release and effective multi-game settings without a project or running game. Read-only. Returns: version, symlink-resolved releasePath, requireProjectPath, maxGames (host cap), backgroundMaxFps, backgroundAudioDriver, idleStopMinutes, and current live and launching session counts. Use before changing release routing; no environment variables, tokens, or credentials are exposed.',
+    annotations: { readOnlyHint: true, idempotentHint: true },
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        version: { type: 'string' },
+        releasePath: { type: 'string' },
+        requireProjectPath: { type: 'boolean' },
+        maxGames: { type: 'number' },
+        backgroundMaxFps: { type: 'number' },
+        backgroundAudioDriver: { type: 'string' },
+        idleStopMinutes: { type: 'number' },
+        live: { type: 'number' },
+        launching: { type: 'number' },
+      },
+      required: [
+        'version',
+        'releasePath',
+        'requireProjectPath',
+        'maxGames',
+        'backgroundMaxFps',
+        'backgroundAudioDriver',
+        'idleStopMinutes',
+        'live',
+        'launching',
+      ],
+    },
+  },
+  {
     name: 'launch_editor',
     description:
       'Open the Godot editor GUI for a project for the human user. Use only when the user explicitly asks to "open the editor"; for any agent-driven work, use the headless scene/node tools (add_node, set_node_properties, etc.) instead - the editor cannot be controlled programmatically. Returns plain-text confirmation after spawning the editor process. Errors if projectPath has no project.godot.',
@@ -1978,6 +2010,34 @@ export async function handleRunScript(
       ]),
     );
   }
+}
+
+export async function handleGetServerInfo(
+  _runner: GodotRunner,
+  _args: OperationParams,
+  ctx: McpContext = createNullContext(),
+): Promise<HandlerResult> {
+  if (!ctx.serverIdentity || !ctx.serverConfig || !ctx.sessions) {
+    return err(
+      createErrorResponse('Server identity is unavailable outside a running MCP server context.', [
+        'Connect to the server over stdio and call get_server_info without projectPath.',
+      ]),
+    );
+  }
+  const { sessions } = ctx.sessions.list();
+  const state = (session: unknown) =>
+    session && typeof session === 'object' && 'state' in session ? session.state : null;
+  return createStructuredResponse({
+    version: ctx.serverIdentity.version,
+    releasePath: ctx.serverIdentity.releasePath,
+    requireProjectPath: ctx.serverConfig.requireProjectPath,
+    maxGames: ctx.serverConfig.maxGames,
+    backgroundMaxFps: ctx.serverConfig.backgroundMaxFps,
+    backgroundAudioDriver: ctx.serverConfig.backgroundAudioDriver,
+    idleStopMinutes: ctx.serverConfig.idleStopMinutes,
+    live: sessions.filter((session) => state(session) === 'live').length,
+    launching: sessions.filter((session) => state(session) === 'launching').length,
+  });
 }
 
 export async function handleListSessions(

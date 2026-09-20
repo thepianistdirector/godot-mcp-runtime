@@ -38,6 +38,7 @@ vi.mock('../../src/utils/bridge-manager.js', async () => ({
     inject = injectMock;
     cleanup = vi.fn();
     getLastInjectedPort = () => 12346;
+    readBakedPort = () => 12346;
   },
 }));
 
@@ -52,6 +53,7 @@ import { DEFAULT_SERVER_CONFIG } from '../../src/utils/server-config.js';
 import { dispatchToolCall, toolDispatch } from '../../src/dispatch.js';
 import { createNullContext } from '../../src/utils/mcp-context.js';
 import { BridgeAutoloadCollisionError } from '../../src/utils/bridge-manager.js';
+import { DebuggerProfiler } from '../../src/utils/profiler.js';
 
 const stamp = 'Sun Sep 20 09:00:00 2026';
 const row = (pid: number, command: string, ppid = process.pid): HostProcess => ({
@@ -272,7 +274,12 @@ describe('P1 production lifecycle recovery', () => {
           error: 'injected timeout',
         });
       if (shape === 'thrown exception') await expect(run()).rejects.toThrow('injected exception');
-      else expect((await run()).isError).toBe(true);
+      else {
+        const response = await run();
+        expect(response.isError).toBe(true);
+        if (shape === 'readiness failure')
+          expect(response.content[0]?.text).toContain('Actual reason: injected timeout');
+      }
       expect(pool.list().limits.launching).toBe(0);
       expect(records()).toEqual([]);
       expect((await run()).isError).toBeFalsy();
@@ -320,7 +327,13 @@ describe('P1 production lifecycle recovery', () => {
   it('F10 a late replaced-process exit cannot erase its replacement record', async () => {
     await run();
     const previous = children[0]!;
-    previous.kill.mockReturnValue(true);
+    // Confirm the real exit, then deliver a duplicate old notification after
+    // replacement to retain the epoch/record guard assertion.
+    previous.kill.mockImplementation(() => {
+      previous.emit('exit', null);
+      rows = rows.filter((r) => r.pid !== previous.pid);
+      return true;
+    });
     await run();
     const replacement = records();
     previous.emit('exit', null);
@@ -358,4 +371,310 @@ describe('shared process parser examples', () => {
       ),
     ).toEqual(c.path === null ? [] : [c.path]);
   });
+});
+
+describe('round 2 production boundaries', () => {
+  it('R2 ignored graceful termination escalates and confirms exit before replacement', async () => {
+    await run();
+    const old = children[0]!;
+    old.kill.mockImplementation((signal) => {
+      if (signal === 'SIGKILL') {
+        old.emit('exit', null);
+        rows = rows.filter((r) => r.pid !== old.pid);
+      }
+      return true;
+    });
+    vi.useFakeTimers();
+    try {
+      const replacing = run();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(children).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect((await replacing).isError).toBeFalsy();
+      expect(old.kill.mock.calls.map((c) => c[0])).toEqual(['SIGTERM', 'SIGKILL']);
+      expect(children).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('R2 unconfirmed forced termination refuses and later exit still clears the old session', async () => {
+    await run();
+    const old = children[0]!;
+    old.kill.mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      const replacing = run();
+      await vi.advanceTimersByTimeAsync(4100);
+      const response = await replacing;
+      expect(response.isError).toBe(true);
+      expect(response.content[0]?.text).toContain('Could not confirm exit');
+      expect(children).toHaveLength(1);
+      expect(records()).toHaveLength(1);
+      expect(pool.list().limits.launching).toBe(0);
+      old.emit('exit', 7);
+      rows = rows.filter((r) => r.pid !== old.pid);
+      expect(runners[1]!.activeSessionMode).toBeNull();
+      expect(records()).toEqual([]);
+      expect((await run()).isError).toBeFalsy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('R2 replacement readiness failure tears down the new child and permits retry', async () => {
+    await run();
+    vi.mocked(GodotRunner.prototype.waitForBridge).mockResolvedValueOnce({
+      ready: false,
+      error: 'replacement readiness timeout',
+    });
+    const response = await run();
+    expect(response.isError).toBe(true);
+    expect(response.content[0]?.text).toContain('Actual reason: replacement readiness timeout');
+    expect(records()).toEqual([]);
+    expect(runners[1]!.activeSessionMode).toBeNull();
+    expect(pool.list().limits.launching).toBe(0);
+    expect(pool.list().recentlyEnded.map((r) => r.reason)).toEqual(['replaced', 'launch_failed']);
+    expect((await run()).isError).toBeFalsy();
+  });
+  it('R2 replacement waits for the old child before spawning its successor', async () => {
+    await run();
+    const old = children[0]!;
+    old.kill.mockImplementation(() => true);
+    const replacing = run();
+    await vi.waitFor(() => expect(old.kill).toHaveBeenCalled());
+    const childrenBeforeExit = children.length;
+    old.emit('exit', null);
+    rows = rows.filter((r) => r.pid !== old.pid);
+    expect((await replacing).isError).toBeFalsy();
+    expect(childrenBeforeExit).toBe(1);
+    expect(rows.filter((r) => r.command.includes(`--path ${project}`))).toHaveLength(1);
+  });
+
+  it('R2 injection failure after replacement stop leaves no stranded spawned mode', async () => {
+    await run();
+    const old = children[0]!;
+    old.kill.mockImplementation(() => true);
+    injectMock.mockImplementationOnce(() => {
+      throw new BridgeAutoloadCollisionError('replacement collision');
+    });
+    const replacing = run();
+    await vi.waitFor(() => expect(old.kill).toHaveBeenCalled());
+    old.emit('exit', 7);
+    rows = rows.filter((r) => r.pid !== old.pid);
+    expect((await replacing).isError).toBe(true);
+    expect(runners[1]!.activeSessionMode).toBeNull();
+    expect(runners[1]!.activeBridgePort).toBeNull();
+    expect(runners[1]!.hasActiveRuntimeSession()).toBe(false);
+    expect(records()).toEqual([]);
+    expect(pool.list().limits.launching).toBe(0);
+    expect((await run()).isError).toBeFalsy();
+  });
+
+  it.each(['spawn', 'profiler'])(
+    'R2 pre-child %s failure after replacement clears all launch state',
+    async (failure) => {
+      await run();
+      if (failure === 'spawn')
+        spawnMock.mockImplementationOnce(() => {
+          throw new Error('injected spawn failure');
+        });
+      else
+        vi.spyOn(DebuggerProfiler, 'create').mockRejectedValueOnce(
+          new Error('injected profiler failure'),
+        );
+      const response = await run({ profiling: failure === 'profiler' });
+      expect(response.isError).toBe(true);
+      expect(response.content[0]?.text).toContain(`injected ${failure} failure`);
+      expect(runners[1]!.activeSessionMode).toBeNull();
+      expect(runners[1]!.activeBridgePort).toBeNull();
+      expect(runners[1]!.activeProjectPath).toBeNull();
+      expect(runners[1]!.activeProcess).toBeNull();
+      expect(runners[1]!.activeProfiler).toBeNull();
+      expect(records()).toEqual([]);
+      expect(pool.list().limits.launching).toBe(0);
+      expect(pool.list().recentlyEnded.map((r) => r.reason)).toEqual(['replaced', 'launch_failed']);
+      expect((await run()).isError).toBeFalsy();
+    },
+  );
+
+  it('R2 orphan admission refuses until termination is confirmed and retains the record', async () => {
+    await run();
+    const old = children[0]!;
+    const file = join(state, 'sessions', readdirSync(join(state, 'sessions'))[0]!);
+    writeFileSync(file, JSON.stringify({ ...records()[0], serverPid: 99999 }));
+    rows = rows.map((r) => (r.pid === old.pid ? { ...r, ppid: 1 } : r));
+    const kills: number[] = [];
+    const observer = new RunnerPool({
+      stateDir: state,
+      listProcesses: () => rows,
+      runnerConfig: { godotPath: process.execPath },
+      kill: (pid) => {
+        kills.push(pid);
+      },
+      serverConfig: { ...DEFAULT_SERVER_CONFIG, maxGames: 3 },
+    });
+    try {
+      expect(
+        (await dispatchToolCall(observer, 'run_project', { projectPath: project }, context()))
+          .isError,
+      ).toBe(true);
+      expect(kills).toEqual([old.pid]);
+      expect(records()).toHaveLength(1);
+      expect(children).toHaveLength(1);
+    } finally {
+      await observer.stopAll();
+    }
+  });
+
+  it.each([' -e ', ' --editor ', ' --headless ', ' -p ', ' --project-manager ', ' -d '])(
+    'R2 exact owned path takes precedence over flattened flags: %s',
+    async (token) => {
+      project = join(scratch, `game${token}suffix`);
+      mkdirSync(project);
+      writeFileSync(join(project, 'project.godot'), 'config_version=5\n');
+      await run();
+      const observer = makePool();
+      try {
+        expect(
+          (await dispatchToolCall(observer, 'run_project', { projectPath: project }, context()))
+            .isError,
+        ).toBe(true);
+        expect(children).toHaveLength(1);
+        expect(children[0]!.kill).not.toHaveBeenCalled();
+      } finally {
+        await observer.stopAll();
+      }
+    },
+  );
+
+  it.each([' -e ', ' --editor ', ' --headless ', ' -p ', ' --project-manager ', ' -s '])(
+    'R2 unrecorded ambiguous external path refuses without a signal: %s',
+    async (token) => {
+      project = join(scratch, `game${token}suffix`);
+      mkdirSync(project);
+      writeFileSync(join(project, 'project.godot'), 'config_version=5\n');
+      rows.push(row(80000, `/Applications/Godot.app/Contents/MacOS/Godot --path ${project}`, 1));
+      const kills = vi.spyOn(process, 'kill');
+      expect((await run()).isError).toBe(true);
+      expect(children).toEqual([]);
+      expect(kills).not.toHaveBeenCalled();
+      expect(pool.list().limits.launching).toBe(0);
+    },
+  );
+
+  it('R2 unrelated excluded processes never consume game capacity or receive signals', async () => {
+    for (const [index, flag] of ['--editor', '--headless', '--project-manager'].entries()) {
+      rows.push(
+        row(
+          80000 + index,
+          `/Applications/Godot.app/Contents/MacOS/Godot --path ${scratch}/unrelated${index} ${flag}`,
+          1,
+        ),
+      );
+    }
+    const kills = vi.spyOn(process, 'kill');
+    expect((await run()).isError).toBeFalsy();
+    expect(pool.list().limits.gamesOnHost).toBe(1);
+    expect(kills).not.toHaveBeenCalled();
+    expect(children).toHaveLength(1);
+  });
+
+  it.each([null, '', '  ', 42, false, {}, []])(
+    'R2 supplied invalid path never selects the sole session: %j',
+    async (value) => {
+      await run();
+      const handler = vi.spyOn(toolDispatch, 'get_debug_output');
+      for (const key of ['projectPath', 'project_path']) {
+        expect(
+          (await dispatchToolCall(pool, 'get_debug_output', { [key]: value }, context())).isError,
+        ).toBe(true);
+      }
+      expect(handler).not.toHaveBeenCalled();
+      expect((await dispatchToolCall(pool, 'get_debug_output', {}, context())).isError).toBeFalsy();
+      expect(handler).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('R2 get_server_info is registered and reports context without a project or spawn', async () => {
+    const ctx = {
+      ...context(),
+      serverIdentity: { version: '3.6.0', releasePath: '/fixture/release' },
+    };
+    const response = await dispatchToolCall(pool, 'get_server_info', {}, ctx);
+    expect(response.isError).toBeFalsy();
+    expect(response.structuredContent).toMatchObject({
+      version: '3.6.0',
+      releasePath: '/fixture/release',
+      maxGames: 3,
+      live: 0,
+      launching: 0,
+    });
+    expect(children).toEqual([]);
+  });
+
+  it('R2 get_server_info counts actual pending and live sessions without touching them', async () => {
+    const ctx = {
+      ...context(),
+      serverIdentity: { version: '3.6.0', releasePath: '/fixture/release' },
+    };
+    let release!: (value: { ready: boolean }) => void;
+    vi.mocked(GodotRunner.prototype.waitForBridge).mockImplementationOnce(
+      () =>
+        new Promise((r) => {
+          release = r;
+        }),
+    );
+    const pending = run();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const starting = await dispatchToolCall(pool, 'get_server_info', {}, ctx);
+    release({ ready: true });
+    await pending;
+    expect(starting.structuredContent).toMatchObject({ live: 0, launching: 1 });
+    expect(
+      (await dispatchToolCall(pool, 'get_server_info', {}, ctx)).structuredContent,
+    ).toMatchObject({ live: 1, launching: 0 });
+    expect(children[0]!.kill).not.toHaveBeenCalled();
+  });
+
+  it.each([' -e ', ' -p ', ' -s '])(
+    'R2 owned orphan with flattened flags remains protected until confirmed exit: %s',
+    async (flag) => {
+      project = join(scratch, `game${flag}suffix`);
+      mkdirSync(project);
+      writeFileSync(join(project, 'project.godot'), 'config_version=5\n');
+      await run();
+      const old = children[0]!;
+      const file = join(state, 'sessions', readdirSync(join(state, 'sessions'))[0]!);
+      writeFileSync(file, JSON.stringify({ ...records()[0], serverPid: 99999 }));
+      rows = rows.map((p) => (p.pid === old.pid ? { ...p, ppid: 1 } : p));
+      const kills: number[] = [];
+      const observer = new RunnerPool({
+        stateDir: state,
+        listProcesses: () => rows,
+        kill: (p) => {
+          kills.push(p);
+        },
+        runnerConfig: { godotPath: process.execPath },
+      });
+      try {
+        expect(
+          (await dispatchToolCall(observer, 'run_project', { projectPath: project }, context()))
+            .isError,
+        ).toBe(true);
+        expect(kills).toEqual([old.pid]);
+        expect(records()).toHaveLength(1);
+        expect(children).toHaveLength(1);
+        old.emit('exit', 0);
+        rows = rows.filter((p) => p.pid !== old.pid);
+        expect(
+          (await dispatchToolCall(observer, 'run_project', { projectPath: project }, context()))
+            .isError,
+        ).toBeFalsy();
+        expect(records()).toHaveLength(1);
+      } finally {
+        await observer.stopAll();
+      }
+    },
+  );
 });

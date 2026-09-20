@@ -18,7 +18,15 @@
 
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { isAbsolute, join, resolve, sep } from 'path';
 
 import { GodotRunner, type GodotProcess, type GodotServerConfig } from './godot-runner.js';
@@ -60,6 +68,19 @@ export type Canonicalized =
  * have the canonical value overwritten by the alias it kept.
  */
 export function canonicalizeProjectArgs(args: OperationParams, cwd?: string): Canonicalized {
+  for (const name of ['projectPath', 'project_path']) {
+    if (
+      Object.prototype.hasOwnProperty.call(args, name) &&
+      (typeof args[name] !== 'string' ||
+        (args[name] as string).trim() === '' ||
+        (args[name] as string).includes('\0'))
+    ) {
+      return {
+        ok: false,
+        message: `${name} must be a non-empty project path string when supplied. Omit it only when this server permits implicit routing.`,
+      };
+    }
+  }
   const camel = args.projectPath;
   const snake = args.project_path;
   if (camel !== undefined && snake !== undefined && camel !== snake) {
@@ -139,6 +160,11 @@ export interface HostGame extends HostProcess {
  * owner leaves open has no `--path` and is never a game.
  */
 export function gamesOnHost(procs: HostProcess[]): HostGame[] {
+  return parseHostGames(procs, false);
+}
+
+/** Admission also inspects flags after --path: ps may have split a folder name. */
+function parseHostGames(procs: HostProcess[], includeAmbiguousPaths: boolean): HostGame[] {
   const games: HostGame[] = [];
   for (const p of procs) {
     const tokens = [...p.command.matchAll(/\S+/g)];
@@ -146,13 +172,12 @@ export function gamesOnHost(procs: HostProcess[]): HostGame[] {
     if (!/(^|\/)godot[^/]*$/i.test(bin)) continue;
     const end = tokens.findIndex((t) => t[0] === '--');
     const engine = end === -1 ? tokens.slice(1) : tokens.slice(1, end);
-    if (
-      engine.some((t) => ['--headless', '-e', '--editor', '-p', '--project-manager'].includes(t[0]))
-    ) {
-      continue;
-    }
     const i = engine.findIndex((t) => t[0] === '--path');
     if (i === -1 || i + 1 >= engine.length) continue;
+    const excluded = engine.findIndex((t) =>
+      ['--headless', '-e', '--editor', '-p', '--project-manager'].includes(t[0]),
+    );
+    if (excluded !== -1 && (!includeAmbiguousPaths || excluded < i + 1)) continue;
     // A path with spaces is split by ps; rejoin up to the next engine flag.
     const parts: RegExpExecArray[] = [];
     for (const token of engine.slice(i + 1)) {
@@ -209,7 +234,11 @@ const LIFECYCLE_TOOLS: ReadonlySet<string> = new Set([
 ]);
 
 /** Tools that take no project at all. */
-const NO_PROJECT_TOOLS: ReadonlySet<string> = new Set(['list_projects', 'list_sessions']);
+const NO_PROJECT_TOOLS: ReadonlySet<string> = new Set([
+  'list_projects',
+  'list_sessions',
+  'get_server_info',
+]);
 
 export type Resolution =
   | { kind: 'runner'; runner: GodotRunner; key: string | null }
@@ -495,14 +524,22 @@ export class RunnerPool {
     } catch (error) {
       return `Process inspection failed: ${String(error)}. Cannot establish ownership or host capacity; retry when ps is available.`;
     }
-    const games = gamesOnHost(procs);
+    let games: HostGame[];
+    try {
+      games = this.knownGames(procs);
+    } catch (error) {
+      return `Ownership inspection failed: ${String(error)}. Cannot establish host capacity; retry when session records are readable.`;
+    }
     const active = e.runner.activeProcess;
     const ownPid = active && !active.hasExited ? (active.process.pid ?? null) : null;
     const rec = this.readPidFile(key);
 
     // Same-path strangers: the server kills only what a server of this build
     // started and whose server is gone. Anything else is a refusal.
-    for (const g of games) {
+    const ambiguous = parseHostGames(procs, true).filter(
+      (g) => !games.some((known) => known.pid === g.pid) && possiblySameProject(g.projectPath, key),
+    );
+    for (const g of [...games, ...ambiguous]) {
       const ours =
         rec !== null &&
         rec.projectPath === key &&
@@ -525,6 +562,15 @@ export class RunnerPool {
       if (ours !== null && ours.serverStartedAt && !serverAlive && !liveNodeParent) {
         logDebug(`Reaping orphan game ${g.pid} for ${key} (its server ${ours.serverPid} is gone)`);
         this.kill(g.pid);
+        let after: HostProcess[];
+        try {
+          after = this.listProcesses();
+        } catch (error) {
+          return `Orphan termination requested but process inspection failed: ${String(error)}. Ownership retained; retry run_project after inspection recovers.`;
+        }
+        if (after.some((p) => p.pid === g.pid && p.startedAt === g.startedAt)) {
+          return `Orphan termination requested for pid ${g.pid}, but exit is unconfirmed. Ownership retained and no replacement started; wait and retry run_project.`;
+        }
         this.removeMatchingRecord(ours);
         continue;
       }
@@ -619,7 +665,7 @@ export class RunnerPool {
           if (e.runner.activeProcess === child) await e.runner.stopProject();
           this.finishProcess(e.owned, child.exitCode);
         } else if (e.owned && !e.owned.ended) {
-          e.owned.intent = null;
+          if (!e.owned.proc.terminationRequested) e.owned.intent = null;
         } else {
           this.recentlyEnded.push({
             projectPath: key,
@@ -743,6 +789,32 @@ export class RunnerPool {
     return join(this.stateDir, 'sessions', `${createHash('sha1').update(key).digest('hex')}.json`);
   }
 
+  /** Exact recorded PID/start identity wins before ps's lossy editor/flag parsing. */
+  private knownGames(procs: HostProcess[]): HostGame[] {
+    const games = new Map<number, HostGame>();
+    if (this.stateDir) {
+      const directory = join(this.stateDir, 'sessions');
+      if (existsSync(directory)) {
+        for (const name of readdirSync(directory)) {
+          if (!name.endsWith('.json')) continue;
+          let rec: PidFile;
+          try {
+            rec = JSON.parse(readFileSync(join(directory, name), 'utf8')) as PidFile;
+          } catch {
+            continue;
+          }
+          if (!rec || typeof rec.projectPath !== 'string' || !rec.startedAt) continue;
+          const live = procs.find((p) => p.pid === rec.pid && p.startedAt === rec.startedAt);
+          if (live) games.set(live.pid, { ...live, projectPath: rec.projectPath });
+        }
+      }
+    }
+    for (const game of gamesOnHost(procs)) {
+      if (!games.has(game.pid)) games.set(game.pid, game);
+    }
+    return [...games.values()];
+  }
+
   private writePidFile(rec: PidFile): void {
     const path = this.pidFilePath(rec.projectPath);
     if (!path || rec.pid < 0) return;
@@ -829,7 +901,7 @@ export class RunnerPool {
     let hostCount: number | null = null;
     let processInspectionError: string | null = null;
     try {
-      hostCount = gamesOnHost(this.listProcesses()).length;
+      hostCount = this.knownGames(this.listProcesses()).length;
     } catch (error) {
       processInspectionError = String(error);
     }

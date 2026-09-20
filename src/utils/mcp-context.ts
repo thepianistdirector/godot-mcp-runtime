@@ -89,6 +89,8 @@ export interface McpContext {
   sessions?: SessionDirectory;
   /** Server-wide settings for many games at once; absent means upstream behaviour. */
   serverConfig?: ServerConfig;
+  /** Public identity of the actual running release, supplied only by the server entry point. */
+  serverIdentity?: { version: string; releasePath: string };
 }
 
 /** The slice of RunnerPool a handler may touch. Kept structural so utils/ has no cycle. */

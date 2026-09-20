@@ -16,7 +16,7 @@ import { startProgressHeartbeat } from './utils/progress-heartbeat.js';
 import type { GodotServerConfig } from './utils/godot-runner.js';
 import { RunnerPool } from './utils/runner-pool.js';
 import { loadServerConfig } from './utils/server-config.js';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, realpathSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { getErrorMessage } from './utils/error-response.js';
@@ -52,6 +52,7 @@ Tool categories:
 - Profiling (requires run_project with profiling: true): profile_project, start_profiler, stop_profiler
 - Project config (no Godot process): list_autoloads, add_autoload, remove_autoload, update_autoload, get_project_files, search_project, get_scene_dependencies, get_project_settings
 - Validation: validate
+- Server inspection (read-only, no project needed): get_server_info, list_sessions
 
 Key behaviors:
 - All mutation operations (add_node, set_node_properties, delete_nodes, etc.) save the scene automatically. Only use save_scene for save-as (newPath) or re-canonicalization.
@@ -124,7 +125,10 @@ class GodotMcpServer {
   constructor(config?: GodotServerConfig) {
     // Settings for many games at once live beside the build, so a client that
     // names only the entry point (.mcp.json, a codex -c override) gets them too.
-    const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const packageRoot = realpathSync.native(join(dirname(fileURLToPath(import.meta.url)), '..'));
+    const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as {
+      version: string;
+    };
     const loaded = loadServerConfig(
       process.env,
       (path) => (existsSync(path) ? readFileSync(path, 'utf8') : null),
@@ -141,7 +145,7 @@ class GodotMcpServer {
     this.server = new Server(
       {
         name: 'godot-mcp',
-        version: '3.6.0',
+        version: manifest.version,
       },
       {
         capabilities: {
@@ -151,7 +155,10 @@ class GodotMcpServer {
       },
     );
 
-    this.ctx = createContextFromServer(this.server);
+    this.ctx = {
+      ...createContextFromServer(this.server),
+      serverIdentity: { version: manifest.version, releasePath: packageRoot },
+    };
     // The disable-security startup lines are emitted by createContextFromServer.
     // Strict mode and the elicitation opt-out only describe a gate that still
     // runs, so both stay silent once security is off.

@@ -91,7 +91,13 @@ function makePool(opts: {
     listProcesses: opts.procs ?? (() => []),
     stateDir: opts.stateDir ?? null,
     ...(opts.now ? { now: opts.now } : {}),
-    kill: (pid) => killed.push(pid),
+    kill: (pid) => {
+      killed.push(pid);
+      // Model confirmed immediate exit; pending termination has separate coverage.
+      const table = opts.procs?.();
+      const index = table?.findIndex((p) => p.pid === pid) ?? -1;
+      if (table && index >= 0) table.splice(index, 1);
+    },
     createRunner: () => {
       const r = fakeRunner();
       made.push(r);
