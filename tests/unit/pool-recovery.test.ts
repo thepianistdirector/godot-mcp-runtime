@@ -14,10 +14,11 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { ChildProcess } from 'child_process';
 
-const { spawnMock, injectMock, psMock } = vi.hoisted(() => ({
+const { spawnMock, injectMock, psMock, portMock } = vi.hoisted(() => ({
   spawnMock: vi.fn(),
   injectMock: vi.fn(),
   psMock: vi.fn(),
+  portMock: vi.fn(),
 }));
 vi.mock('child_process', async () => ({
   ...(await vi.importActual('child_process')),
@@ -26,7 +27,7 @@ vi.mock('child_process', async () => ({
 }));
 vi.mock('../../src/utils/bridge-protocol.js', async () => ({
   ...(await vi.importActual('../../src/utils/bridge-protocol.js')),
-  findFreePort: async () => 12346,
+  findFreePort: portMock,
 }));
 vi.mock('../../src/utils/path-validation.js', async () => ({
   ...(await vi.importActual('../../src/utils/path-validation.js')),
@@ -108,6 +109,8 @@ beforeEach(() => {
   injectMock.mockReset();
   spawnMock.mockReset();
   psMock.mockReset();
+  let nextPort = 12346;
+  portMock.mockReset().mockImplementation(async () => nextPort++);
   vi.spyOn(GodotRunner.prototype, 'waitForBridge').mockResolvedValue({ ready: true });
   vi.spyOn(GodotRunner.prototype, 'sendCommand').mockResolvedValue('{}');
   spawnMock.mockImplementation((_bin: string, args: string[]) => {
@@ -357,6 +360,212 @@ describe('P1 production lifecycle recovery', () => {
     rows.push(row(60000, `/Applications/Godot.app/Contents/MacOS/Godot --path ${project} -d`));
     expect(pool.admit(project)).toMatch(/Another Godot game/);
     expect(pool.admit(project + ' -draft')).toMatch(/Another Godot game/);
+  });
+});
+
+describe('accepted PR process failures', () => {
+  it('PR port exhaustion preserves the other session holding the port even after reservation expiry', async () => {
+    portMock.mockResolvedValue(12346);
+    await run();
+    const record = records();
+    const other = join(scratch, 'other');
+    mkdirSync(other);
+    writeFileSync(join(other, 'project.godot'), 'config_version=5\n');
+    clock += 31000;
+    const response = await run({ projectPath: other });
+    expect(response.isError).toBe(true);
+    expect(response.content[0]?.text).toContain('Could not allocate an unreserved bridge port');
+    expect(records()).toEqual(record);
+    expect(children).toHaveLength(1);
+    expect(children[0]!.kill).not.toHaveBeenCalled();
+    expect(pool.list().limits.launching).toBe(0);
+  });
+
+  it('PR allocation accepts a fresh last candidate within the bounded retries', async () => {
+    portMock.mockResolvedValue(12346);
+    await run();
+    let attempts = 0;
+    portMock.mockImplementation(async () => (++attempts === 21 ? 12347 : 12346));
+    expect((await run()).isError).toBeFalsy();
+    expect(attempts).toBe(21);
+    expect(runners[1]!.activeBridgePort).toBe(12347);
+  });
+
+  it('PR exhausted reserved port candidates refuse replacement and allow a fresh-port retry', async () => {
+    portMock.mockResolvedValue(12346);
+    await run();
+    const old = children[0]!;
+    portMock.mockClear();
+    const response = await run();
+    expect(response.isError).toBe(true);
+    expect(response.content[0]?.text).toContain('Could not allocate an unreserved bridge port');
+    expect(portMock).toHaveBeenCalledTimes(21);
+    expect(children).toHaveLength(1);
+    expect(runners[1]!.activeProcess).toBeNull();
+    expect(runners[1]!.activeBridgePort).toBeNull();
+    expect(runners[1]!.activeSessionMode).toBeNull();
+    expect(pool.list().limits.launching).toBe(0);
+    expect(records()).toEqual([]);
+    expect(rows.some((p) => p.pid === old.pid)).toBe(false);
+    expect(pool.list().recentlyEnded.map((entry) => entry.reason)).toEqual([
+      'replaced',
+      'launch_failed',
+    ]);
+    portMock.mockResolvedValue(12347);
+    expect((await run()).isError).toBeFalsy();
+    expect(records()).toHaveLength(1);
+    expect(runners[1]!.activeBridgePort).toBe(12347);
+  });
+
+  it.each(['run_project', 'stop_project'])(
+    'PR failed TERM/KILL error events retain ownership and refuse %s until real exit',
+    async (tool) => {
+      await run();
+      const old = children[0]!;
+      const record = records();
+      const proc = runners[1]!.activeProcess!;
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      old.kill.mockImplementation((signal) => {
+        old.emit(
+          'error',
+          Object.assign(new Error(`${String(signal)} EPERM`), { code: 'EPERM', syscall: 'kill' }),
+        );
+        return false;
+      });
+      vi.useFakeTimers();
+      try {
+        const request = () =>
+          dispatchToolCall(pool, tool, { projectPath: project }, context()).then(
+            (response) => ({
+              kind: 'response',
+              refused: response.isError === true,
+              diagnostic: response.content[0]?.text,
+            }),
+            (error: unknown) => ({ kind: 'rejection', refused: true, diagnostic: String(error) }),
+          );
+        const pending = request();
+        await vi.advanceTimersByTimeAsync(4100);
+        const response = await pending;
+        expect(response.kind).toBe(tool === 'stop_project' ? 'rejection' : 'response');
+        expect(response.refused).toBe(true);
+        expect(response.diagnostic).toContain('Could not confirm exit');
+        expect(old.kill.mock.calls.map((call) => call[0])).toEqual(['SIGTERM', 'SIGKILL']);
+        expect(proc.hasExited).toBe(false);
+        expect(runners[1]!.activeProcess).toBe(proc);
+        expect(records()).toEqual(record);
+        expect(children).toHaveLength(1);
+        expect(rows.filter((p) => p.command.includes(`--path ${project}`))).toHaveLength(1);
+        expect(pool.list().limits.launching).toBe(0);
+        expect(pool.list().recentlyEnded).toEqual([]);
+        expect(errors.mock.calls.flat().map(String).join('\n')).toContain('EPERM');
+
+        const retry = request();
+        await vi.advanceTimersByTimeAsync(4100);
+        expect((await retry).refused).toBe(true);
+        expect(old.kill).toHaveBeenCalledTimes(4);
+        expect(children).toHaveLength(1);
+        expect(records()).toEqual(record);
+
+        old.emit('exit', 7);
+        rows = rows.filter((p) => p.pid !== old.pid);
+        expect(proc.hasExited).toBe(true);
+        expect(runners[1]!.activeSessionMode).toBeNull();
+        expect(records()).toEqual([]);
+        expect(pool.list().recentlyEnded).toEqual([
+          expect.objectContaining({
+            pid: old.pid,
+            reason: tool === 'run_project' ? 'replaced' : 'stopped',
+            exitCode: 7,
+          }),
+        ]);
+        expect((await run()).isError).toBeFalsy();
+        const replacement = records();
+        old.emit('error', new Error('late old child error'));
+        old.emit('exit', 7);
+        expect(records()).toEqual(replacement);
+        expect(pool.list().recentlyEnded).toHaveLength(1);
+      } finally {
+        if (!proc.hasExited) {
+          old.emit('exit', 7);
+          rows = rows.filter((p) => p.pid !== old.pid);
+        }
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('PR a non-spawn child error retains live status, profiler and ownership until exit', async () => {
+    await run();
+    const old = children[0]!;
+    const record = records();
+    const profiler = { close: vi.fn(), hasResult: false } as unknown as DebuggerProfiler;
+    runners[1]!.activeProfiler = profiler;
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    old.emit('error', Object.assign(new Error('send EPIPE'), { code: 'EPIPE', syscall: 'write' }));
+    expect(runners[1]!.activeProcess!.hasExited).toBe(false);
+    expect(runners[1]!.activeProfiler).toBe(profiler);
+    expect(profiler.close).not.toHaveBeenCalled();
+    expect(records()).toEqual(record);
+    expect(pool.list().recentlyEnded).toEqual([]);
+    old.emit('exit', 2);
+    rows = rows.filter((p) => p.pid !== old.pid);
+    expect(records()).toEqual([]);
+    expect(pool.list().recentlyEnded).toEqual([
+      expect.objectContaining({ pid: old.pid, reason: 'exited', exitCode: 2 }),
+    ]);
+  });
+
+  it('PR a refused idle stop is reported, retains ownership and does not block a sibling', async () => {
+    await run();
+    const old = children[0]!;
+    const proc = runners[1]!.activeProcess!;
+    const record = records();
+    const sibling = join(scratch, 'sibling');
+    mkdirSync(sibling);
+    writeFileSync(join(sibling, 'project.godot'), 'config_version=5\n');
+    expect((await run({ projectPath: sibling })).isError).toBeFalsy();
+    old.kill.mockImplementation(() => true);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    clock += 120000;
+    vi.useFakeTimers();
+    try {
+      const pending = pool.sweepIdle().then(
+        () => ({ ok: true }),
+        (error: unknown) => ({ ok: false, error }),
+      );
+      await vi.advanceTimersByTimeAsync(4100);
+      expect(await pending).toEqual({ ok: true });
+      expect(old.kill.mock.calls.map((call) => call[0])).toEqual(['SIGTERM', 'SIGKILL']);
+      expect(proc.hasExited).toBe(false);
+      expect(records()).toEqual(record);
+      expect(children[1]!.kill).toHaveBeenCalledOnce();
+      expect(pool.list().recentlyEnded).toEqual([
+        expect.objectContaining({ pid: children[1]!.pid, reason: 'idle_stop' }),
+      ]);
+      const diagnostic = errors.mock.calls.flat().map(String).join('\n');
+      expect(diagnostic).toContain(project);
+      expect(diagnostic).toContain('Could not confirm exit');
+      expect(diagnostic).toContain('ownership is retained');
+
+      const retry = pool.sweepIdle();
+      await vi.advanceTimersByTimeAsync(4100);
+      await retry;
+      expect(old.kill).toHaveBeenCalledTimes(4);
+      expect(records()).toEqual(record);
+      old.emit('exit', 0);
+      rows = rows.filter((p) => p.pid !== old.pid);
+      expect(records()).toEqual([]);
+      expect(pool.list().recentlyEnded.filter((entry) => entry.pid === old.pid)).toEqual([
+        expect.objectContaining({ reason: 'idle_stop', exitCode: 0 }),
+      ]);
+      expect((await run()).isError).toBeFalsy();
+    } finally {
+      if (!proc.hasExited) {
+        old.emit('exit', 0);
+        rows = rows.filter((p) => p.pid !== old.pid);
+      }
+      vi.useRealTimers();
+    }
   });
 });
 

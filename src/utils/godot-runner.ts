@@ -594,12 +594,16 @@ export class GodotRunner {
       });
 
       proc.on('error', (err: Error) => {
-        console.error('Failed to start Godot process:', err);
+        console.error('Godot child process error:', err);
         errors.push(`Process error: ${err.message}`);
-        godotProcess.hasExited = true;
-        // The engine will never dial back, so nothing can arrive on the debugger
-        // listener. Holding the port open until the next run_project is pointless.
-        this.closeProfiler();
+        // A failed spawn has no PID. Once a child exists, errors also report
+        // failed signals/IPC and do not prove exit; retain its live ownership.
+        if (proc.pid === undefined) {
+          godotProcess.hasExited = true;
+          // Nothing can dial the debugger for a failed spawn. A delayed old
+          // error must not close the profiler of a newer session.
+          if (this.sessionEpoch === epoch) this.closeProfiler();
+        }
       });
 
       this.activeProcess = godotProcess;

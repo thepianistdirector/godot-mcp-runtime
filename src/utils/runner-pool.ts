@@ -32,7 +32,7 @@ import { isAbsolute, join, resolve, sep } from 'path';
 import { GodotRunner, type GodotProcess, type GodotServerConfig } from './godot-runner.js';
 import { findFreePort } from './bridge-protocol.js';
 import { DEFAULT_SERVER_CONFIG, type ServerConfig } from './server-config.js';
-import { logDebug } from './logger.js';
+import { logDebug, logError } from './logger.js';
 import type { OperationParams } from '../mcp.types.js';
 
 // ---------------------------------------------------------------------------
@@ -334,6 +334,7 @@ export class RunnerPool {
   }[] = [];
   private idleEnded = new Map<string, number>();
   private sweepTimer: NodeJS.Timeout | null = null;
+  private sweepInFlight = false;
   private serverStartedAt: string | null = null;
   private shuttingDown = false;
 
@@ -355,7 +356,15 @@ export class RunnerPool {
     this.runnerConfig = { ...options.runnerConfig, allocatePort: () => this.allocatePort() };
     this.defaultRunner = this.createRunner(this.runnerConfig);
     if (this.serverConfig.idleStopMinutes > 0) {
-      this.sweepTimer = setInterval(() => void this.sweepIdle(), 60_000);
+      this.sweepTimer = setInterval(() => {
+        if (this.sweepInFlight || this.shuttingDown) return;
+        this.sweepInFlight = true;
+        void this.sweepIdle()
+          .catch((error: unknown) => logError(`Idle sweep failed: ${String(error)}`))
+          .finally(() => {
+            this.sweepInFlight = false;
+          });
+      }, 60_000);
       this.sweepTimer.unref();
     }
   }
@@ -644,6 +653,8 @@ export class RunnerPool {
       this.finishProcess(owned, typeof code === 'number' ? code : null),
     );
     proc.process.once('error', () => {
+      // A post-spawn error (for example kill EPERM) is not an exit event.
+      if (proc.process.pid !== undefined) return;
       owned.intent = 'launch_failed';
       this.finishProcess(owned, null);
     });
@@ -745,13 +756,19 @@ export class RunnerPool {
       if (e.runner.activeSessionMode !== 'spawned' || !RunnerPool.isLive(e.runner)) continue;
       const since = e.lastFinishedAt ?? e.startedAt;
       if (since === null || this.now() - since < limitMs) continue;
-      await this.withLifecycle(e.key, async () => {
-        if (e.inFlight > 0 || e.noIdleStop || !RunnerPool.isLive(e.runner)) return;
-        this.markStopping(e.key, 'idle_stop');
-        await e.runner.stopProject();
-        this.noteStopped(e.key);
-        this.idleEnded.set(e.key, this.now());
-      });
+      try {
+        await this.withLifecycle(e.key, async () => {
+          if (e.inFlight > 0 || e.noIdleStop || !RunnerPool.isLive(e.runner)) return;
+          this.markStopping(e.key, 'idle_stop');
+          await e.runner.stopProject();
+          this.noteStopped(e.key);
+          this.idleEnded.set(e.key, this.now());
+        });
+      } catch (error) {
+        // Keep this child's ownership and exit handler intact; the next
+        // interval may retry it, while other idle projects still get cleaned.
+        logError(`Idle stop failed for ${e.key}: ${String(error)}`);
+      }
     }
   }
 
@@ -775,6 +792,11 @@ export class RunnerPool {
     let port = await findFreePort();
     for (let i = 0; i < 20 && (held.has(port) || this.recentPorts.has(port)); i++) {
       port = await findFreePort();
+    }
+    if (held.has(port) || this.recentPorts.has(port)) {
+      throw new Error(
+        'Could not allocate an unreserved bridge port after 20 retries. No new child was started; retry run_project.',
+      );
     }
     this.recentPorts.set(port, this.now());
     return port;

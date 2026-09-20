@@ -103,7 +103,7 @@ export function loadServerConfig(
       problems.push(`${path}: must be a JSON object; the whole file is ignored`);
     } else if (parsed !== null) {
       for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-        if (!(k in ENV_KEYS)) {
+        if (!Object.hasOwn(ENV_KEYS, k)) {
           problems.push(`${path}: unknown key "${k}"; ignored`);
           continue;
         }

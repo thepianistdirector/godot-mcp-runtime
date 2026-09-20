@@ -10,6 +10,10 @@ A second `run_project` for the same project replaces only that project's game. A
 
 Replacement waits for the old child to exit before transferring its bridge or spawning a successor. After bridge shutdown, it waits up to two seconds each for SIGTERM and SIGKILL. If exit is still unconfirmed, the call fails, retains ownership and starts no successor; retry `stop_project`. Attached external games must be detached and stopped by their owner. An injection, profiler or spawn failure before a child exists clears the abandoned launch state for retry.
 
+A child-process error after a successful spawn, including a failed signal, is reported without marking that child as exited or removing its ownership. Only a spawn failure with no PID or a real exit ends that process. Automatic idle-stop refusals are logged on stderr, preserve ownership and continue cleanup of other idle sessions. Periodic sweeps do not overlap; a still-idle failed session is retried on the next sweep. Explicit stop calls retain their refusal diagnostic.
+
+Automatic bridge-port selection checks active ports and recent reservations. If the initial candidate and 20 retries are all reserved, launch fails with an allocation diagnostic and starts no successor. Retry after a fresh port becomes available.
+
 `get_server_info` is read-only and needs neither a project path nor a running game. It reports the actual server's package `version`, symlink-resolved `releasePath`, effective `requireProjectPath`, `maxGames`, `backgroundMaxFps`, `backgroundAudioDriver`, `idleStopMinutes`, and current `live` and `launching` session counts. Counts describe this server; `maxGames` is the host cap. File settings and environment overrides are already resolved. The response contains only these fields, without environment variables, tokens or credentials.
 
 `list_sessions` is read-only. It returns `sessions`, `recentlyEnded` and `limits`. Sessions identify the path, mode (`spawned` or `attached`), state (`launching`, `live` or `exited`), PID, bridge port, profiler, start, idle duration and last command times. History keeps the last 20 process endings, each with PID and OS start identity, reason (`stopped`, `idle_stop`, `replaced`, `exited`, `launch_failed`, `server_shutdown`), exit code and time. A launch failure before a child exists has a null PID. A retained exited record is not a live session.
@@ -27,6 +31,8 @@ When `requireProjectPath` is false, an omitted path can select the sole live ses
 ## Multi-game server configuration
 
 The server reads `<package-root>/godot-mcp.config.json`, or the file named by `GODOT_MCP_CONFIG`. The environment overrides file values. Missing settings preserve upstream behavior. Invalid settings are diagnosed on stderr and ignored; security switches cannot be configured through this file.
+
+Only the five listed own keys are accepted. Unknown keys, including JavaScript prototype names such as `constructor`, `toString` and `__proto__`, are warned and ignored while valid settings continue to load.
 
 | Setting                 | Environment override                | Default               |
 | ----------------------- | ----------------------------------- | --------------------- |

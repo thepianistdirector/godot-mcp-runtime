@@ -62,6 +62,31 @@ describe('loadServerConfig', () => {
     expect(out.problems.length).toBe(2);
   });
 
+  it.each(Object.getOwnPropertyNames(Object.prototype))(
+    'PR inherited allowlist key %s is warned and ignored without losing valid settings',
+    (key) => {
+      const file = JSON.stringify({
+        requireProjectPath: true,
+        maxGames: 10,
+        [key]: { maxGames: 64 },
+        backgroundMaxFps: 60,
+        backgroundAudioDriver: 'Dummy',
+        idleStopMinutes: 30,
+      });
+      const out = loadServerConfig({ GODOT_MCP_MAX_GAMES: '3' }, () => file, '/pkg/c.json');
+      expect(out.config).toEqual({
+        requireProjectPath: true,
+        maxGames: 3,
+        backgroundMaxFps: 60,
+        backgroundAudioDriver: 'Dummy',
+        idleStopMinutes: 30,
+      });
+      expect(out.problems).toEqual([`/pkg/c.json: unknown key "${key}"; ignored`]);
+      expect(Object.getPrototypeOf(out.config)).toBe(Object.prototype);
+      expect(Object.hasOwn(out.config, key)).toBe(false);
+    },
+  );
+
   it('broken JSON ignores the whole file and says so', () => {
     const out = loadServerConfig({}, () => '{nope', '/pkg/c.json');
     expect(out.config).toEqual({ ...DEFAULT_SERVER_CONFIG });

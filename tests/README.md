@@ -49,6 +49,7 @@ tests/
 
 - `unit/pool-recovery.test.ts`: production dispatch, handler and runner recovery, confirmed replacement/orphan exit, ownership before process parsing, explicit invalid-path refusal, and server-info session counts. Only spawn and bridge I/O are doubled.
 - `integration/server-info.test.ts`: real private stdio discovery and server identity, effective file/environment settings, resolved release symlink, and no-project read-only inspection. `npm test` builds `dist/` first, including on a clean checkout. Direct `npx vitest` or watch invocations require `npm run build` after source changes.
+- `unit/idle-timer-process.test.ts`: a real Node subprocess with strict unhandled-rejection behavior runs the automatic idle timer, verifies refusal diagnostics and sibling cleanup, and preserves ownership of the refused child. Only the minute interval and child I/O are doubled; process-exit waits stay real. Requires built `dist/`, supplied by `npm test`'s pretest build.
 
 ## Running
 
