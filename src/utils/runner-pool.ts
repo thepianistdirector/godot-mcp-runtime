@@ -115,7 +115,10 @@ export function parsePs(text: string): HostProcess[] {
 export const defaultProcessLister: ProcessLister = () => {
   if (process.platform === 'win32') return [];
   try {
+    // LC_ALL=C: `lstart` is localised. On a Spanish macOS it prints "sáb 19 sep …", which the
+    // parser does not read, and an empty table silently switches the host budget off.
     const text = execFileSync('ps', ['-axo', 'pid=,ppid=,rss=,lstart=,command='], {
+      env: { ...process.env, LC_ALL: 'C' },
       encoding: 'utf8',
       maxBuffer: 16 * 1024 * 1024,
     });
