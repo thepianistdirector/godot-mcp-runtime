@@ -93,4 +93,29 @@ describe('runProject userArgs', () => {
       expect(call[1]).toEqual(['--path', projectDir]);
     }
   });
+
+  it('engine options go before the --, so they reach the engine and never the game', async () => {
+    await runner.runProject(projectDir, undefined, true, undefined, false, ['--save-root=/x'], {
+      maxFps: 60,
+      audioDriver: 'Dummy',
+    });
+    expect(argv()).toEqual([
+      '--path',
+      projectDir,
+      '--max-fps',
+      '60',
+      '--audio-driver',
+      'Dummy',
+      '--',
+      '--save-root=/x',
+    ]);
+  });
+
+  it('maxFps 0 and an empty driver add nothing', async () => {
+    await runner.runProject(projectDir, undefined, true, undefined, false, [], {
+      maxFps: 0,
+      audioDriver: '',
+    });
+    expect(argv()).toEqual(['--path', projectDir]);
+  });
 });

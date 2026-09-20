@@ -67,7 +67,8 @@ function coerce(key: keyof ServerConfig, raw: unknown, from: string, problems: s
     problems.push(`${from}: ${key} must be a driver name; ignored`);
     return undefined;
   }
-  const n = typeof raw === 'number' ? raw : typeof raw === 'string' && raw !== '' ? Number(raw) : NaN;
+  const n =
+    typeof raw === 'number' ? raw : typeof raw === 'string' && raw !== '' ? Number(raw) : NaN;
   const [lo, hi] = INT_LIMITS[key] as [number, number];
   if (Number.isInteger(n) && n >= lo && n <= hi) return n;
   problems.push(`${from}: ${key} must be an integer from ${lo} to ${hi}; ignored`);

@@ -1,5 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, existsSync, readdirSync, realpathSync } from 'fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  symlinkSync,
+  writeFileSync,
+  rmSync,
+  existsSync,
+  readdirSync,
+  realpathSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join, relative } from 'path';
 
@@ -22,7 +31,11 @@ import { dispatchToolCall } from '../../src/dispatch.js';
 interface FakeRunner {
   id: number;
   activeSessionMode: 'spawned' | 'attached' | null;
-  activeProcess: { process: { pid: number; once: () => void }; hasExited: boolean; exitCode: number | null } | null;
+  activeProcess: {
+    process: { pid: number; once: () => void };
+    hasExited: boolean;
+    exitCode: number | null;
+  } | null;
   activeProfiler: unknown;
   activeBridgePort: number | null;
   stops: number;
@@ -150,7 +163,11 @@ describe('canonicalizeProjectArgs: the name first, then the path', () => {
   });
 
   it('leaves a call with no project alone', () => {
-    expect(canonicalizeProjectArgs({ limit: 1 })).toEqual({ ok: true, key: null, args: { limit: 1 } });
+    expect(canonicalizeProjectArgs({ limit: 1 })).toEqual({
+      ok: true,
+      key: null,
+      args: { limit: 1 },
+    });
   });
 });
 
@@ -183,7 +200,13 @@ describe('gamesOnHost', () => {
 
   it('parses ps lines with lstart', () => {
     const [p] = parsePs(`  412   1  20480 Sat Sep 19 22:00:00 2026 ${GODOT} --path /w/A1\n`);
-    expect(p).toEqual({ pid: 412, ppid: 1, rssKb: 20480, startedAt: START, command: `${GODOT} --path /w/A1` });
+    expect(p).toEqual({
+      pid: 412,
+      ppid: 1,
+      rssKb: 20480,
+      startedAt: START,
+      command: `${GODOT} --path /w/A1`,
+    });
   });
 });
 
@@ -205,7 +228,9 @@ describe('resolve: a session tool reaches its own session or is refused', () => 
     const { pool, runnerOf } = makePool({ config: { requireProjectPath: true } });
     goLive(runnerOf('/w/A'), 11);
     const res = pool.resolve('simulate_input', null);
-    expect(res.kind === 'refusal' && res.message).toMatch(/^projectPath is required on this server/);
+    expect(res.kind === 'refusal' && res.message).toMatch(
+      /^projectPath is required on this server/,
+    );
   });
 
   it('default mode: none → idle runner, one → it, two → R3', () => {
@@ -216,7 +241,9 @@ describe('resolve: a session tool reaches its own session or is refused', () => 
     expect(pool.resolve('stop_project', null)).toMatchObject({ kind: 'runner', key: '/w/A' });
     goLive(runnerOf('/w/B'), 12);
     const res = pool.resolve('stop_project', null);
-    expect(res.kind === 'refusal' && res.message).toMatch(/^2 runtime sessions are live; say which/);
+    expect(res.kind === 'refusal' && res.message).toMatch(
+      /^2 runtime sessions are live; say which/,
+    );
   });
 
   it('a retained exited process is a record, not a live session', () => {
@@ -249,7 +276,10 @@ describe('resolve: a session tool reaches its own session or is refused', () => 
 
   it('dispatch refuses conflicting spellings before any handler runs', async () => {
     const { pool, made } = makePool({});
-    const res = await dispatchToolCall(pool, 'stop_project', { projectPath: '/a', project_path: '/b' });
+    const res = await dispatchToolCall(pool, 'stop_project', {
+      projectPath: '/a',
+      project_path: '/b',
+    });
     expect(res.isError).toBe(true);
     expect(made.every((r) => r.stops === 0)).toBe(true);
   });
@@ -303,7 +333,10 @@ describe('admit: the host budget', () => {
     await pool.settleLaunch('/w/A', false);
     expect(pool.list().limits.launching).toBe(0);
     expect(pool.admit('/w/B')).toBeNull();
-    expect(pool.list().recentlyEnded.at(-1)).toMatchObject({ projectPath: '/w/A', reason: 'launch_failed' });
+    expect(pool.list().recentlyEnded.at(-1)).toMatchObject({
+      projectPath: '/w/A',
+      reason: 'launch_failed',
+    });
   });
 
   it('a failed launch stops a child that survived it', async () => {
@@ -368,7 +401,12 @@ describe('admit: a Godot game already running this project', () => {
   it('our own orphan, whose server is gone, is reaped', async () => {
     let table: HostProcess[] = [];
     const { pool, killed, stateDir } = await poolWithRecord(() => table);
-    writeRecord(stateDir, '/w/A', { pid: 70, startedAt: START, serverPid: 4242, serverStartedAt: START });
+    writeRecord(stateDir, '/w/A', {
+      pid: 70,
+      startedAt: START,
+      serverPid: 4242,
+      serverStartedAt: START,
+    });
     table = [proc(70, `${GODOT} --path /w/A`, 1)]; // server 4242 is not in the table
     expect(pool.admit('/w/A')).toBeNull();
     expect(killed).toEqual([70]);
@@ -377,7 +415,12 @@ describe('admit: a Godot game already running this project', () => {
   it('a game whose server is alive is refused, not killed', async () => {
     let table: HostProcess[] = [];
     const { pool, killed, stateDir } = await poolWithRecord(() => table);
-    writeRecord(stateDir, '/w/A', { pid: 70, startedAt: START, serverPid: 4242, serverStartedAt: START });
+    writeRecord(stateDir, '/w/A', {
+      pid: 70,
+      startedAt: START,
+      serverPid: 4242,
+      serverStartedAt: START,
+    });
     table = [proc(70, `${GODOT} --path /w/A`, 4242), proc(4242, 'node /x/dist/index.js', 1)];
     expect(pool.admit('/w/A')).toMatch(/belongs to a live MCP server \(pid 4242\)/);
     expect(killed).toEqual([]);
@@ -386,7 +429,12 @@ describe('admit: a Godot game already running this project', () => {
   it('a reused server pid with another start time does not make a dead server look alive', async () => {
     let table: HostProcess[] = [];
     const { pool, killed, stateDir } = await poolWithRecord(() => table);
-    writeRecord(stateDir, '/w/A', { pid: 70, startedAt: START, serverPid: 4242, serverStartedAt: START });
+    writeRecord(stateDir, '/w/A', {
+      pid: 70,
+      startedAt: START,
+      serverPid: 4242,
+      serverStartedAt: START,
+    });
     table = [
       proc(70, `${GODOT} --path /w/A`, 1),
       proc(4242, 'vim notes.txt', 1, 'Sun Sep 20 09:00:00 2026'),
@@ -398,7 +446,12 @@ describe('admit: a Godot game already running this project', () => {
   it('a reused game pid with another start time is a stranger', async () => {
     let table: HostProcess[] = [];
     const { pool, killed, stateDir } = await poolWithRecord(() => table);
-    writeRecord(stateDir, '/w/A', { pid: 70, startedAt: START, serverPid: 4242, serverStartedAt: START });
+    writeRecord(stateDir, '/w/A', {
+      pid: 70,
+      startedAt: START,
+      serverPid: 4242,
+      serverStartedAt: START,
+    });
     table = [proc(70, `${GODOT} --path /w/A`, 1, 'Sun Sep 20 09:00:00 2026')];
     expect(pool.admit('/w/A')).toMatch(/This server did not start it/);
     expect(killed).toEqual([]);
@@ -414,7 +467,9 @@ describe('admit: a Godot game already running this project', () => {
     const { pool, stateDir } = await poolWithRecord(() => []);
     expect(readdirSync(join(stateDir, 'sessions')).length).toBe(1);
     pool.noteStopped('/w/A');
-    expect(existsSync(join(stateDir, 'sessions')) ? readdirSync(join(stateDir, 'sessions')).length : 0).toBe(0);
+    expect(
+      existsSync(join(stateDir, 'sessions')) ? readdirSync(join(stateDir, 'sessions')).length : 0,
+    ).toBe(0);
   });
 });
 

@@ -118,7 +118,7 @@ export const runtimeToolDefinitions = [
         maxFps: {
           type: 'number',
           description:
-            'Frame cap for this run: an integer from 0 to 1000, 0 = uncapped. Overrides the server\'s background cap and also applies to a visible run. It does not control audio.',
+            "Frame cap for this run: an integer from 0 to 1000, 0 = uncapped. Overrides the server's background cap and also applies to a visible run. It does not control audio.",
         },
         audio: {
           type: 'boolean',
@@ -128,7 +128,7 @@ export const runtimeToolDefinitions = [
         idleStopMinutes: {
           type: 'number',
           description:
-            'Pass 0 to exempt this session from the server\'s idle stop (a long playtest). Omit to use the server setting.',
+            "Pass 0 to exempt this session from the server's idle stop (a long playtest). Omit to use the server setting.",
         },
         userArgs: {
           type: 'array',
