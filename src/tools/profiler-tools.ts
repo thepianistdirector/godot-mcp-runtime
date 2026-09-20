@@ -130,6 +130,11 @@ export const profilerToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         seconds: {
           type: 'number',
           description: 'Capture duration in seconds, greater than 0 and at most 60 (default: 5).',
@@ -150,6 +155,11 @@ export const profilerToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         seconds: {
           type: 'number',
           description:
@@ -177,6 +187,11 @@ export const profilerToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         top: topProperty,
         sort: sortProperty,
       },

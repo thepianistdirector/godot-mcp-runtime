@@ -13,7 +13,9 @@
 
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 
-import type { GodotRunner } from './utils/godot-runner.js';
+import { GodotRunner } from './utils/godot-runner.js';
+import { RunnerPool, canonicalizeProjectArgs } from './utils/runner-pool.js';
+import { createErrorResponse } from './utils/error-response.js';
 import type { OperationParams, ToolHandler, ToolName, ToolResponse } from './mcp.types.js';
 import { createNullContext, type McpContext } from './utils/mcp-context.js';
 import { isOk } from './utils/result.js';
@@ -29,6 +31,7 @@ import {
   handleSimulateInput,
   handleGetUiElements,
   handleRunScript,
+  handleListSessions,
 } from './tools/runtime-tools.js';
 
 import {
@@ -85,6 +88,7 @@ export const toolDispatch = {
   get_debug_output: handleGetDebugOutput,
   stop_project: handleStopProject,
   list_projects: (_runner, args) => handleListProjects(args),
+  list_sessions: handleListSessions,
   get_project_info: handleGetProjectInfo,
   take_screenshot: handleTakeScreenshot,
   simulate_input: handleSimulateInput,
@@ -127,8 +131,22 @@ export const toolDispatch = {
   validate: handleValidate,
 } as const satisfies Record<ToolName, ToolHandler>;
 
+/**
+ * Route one tool call. `runnerOrPool` may be a bare GodotRunner (every existing
+ * call site and test): it is wrapped in a pool that always answers with it.
+ *
+ * With a real pool the order is fixed, and each step exists because a reviewer
+ * broke the plan without it:
+ *  1. the project's identity is made canonical and put back into the arguments,
+ *     parameter name first, so no handler ever holds a caller's spelling;
+ *  2. the pool picks the runner, or refuses: a session tool never falls back to
+ *     another project's session;
+ *  3. launches and stops of one project are serialised, and a `run_project`
+ *     passes the host budget before it spawns; whatever happens to the launch,
+ *     its `launching` state is settled in a `finally`.
+ */
 export async function dispatchToolCall(
-  runner: GodotRunner,
+  runnerOrPool: GodotRunner | RunnerPool,
   toolName: string,
   args: OperationParams,
   ctx: McpContext = createNullContext(),
@@ -137,10 +155,54 @@ export async function dispatchToolCall(
   if (!handler) {
     throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
   }
-  const result = await handler(runner, args, ctx);
-  // Map Result → MCP wire shape. The error branch already carries
-  // `isError: true` from createErrorResponse; the success branch flows
-  // through verbatim. This is the only edge where the wire envelope is
-  // emitted — handlers and helpers stay Result-shaped end to end.
-  return isOk(result) ? result.value : result.error;
+  if (runnerOrPool instanceof GodotRunner || !(runnerOrPool instanceof RunnerPool)) {
+    const result = await handler(runnerOrPool as GodotRunner, args, ctx);
+    return isOk(result) ? result.value : result.error;
+  }
+  const pool = runnerOrPool;
+
+  const canonical = canonicalizeProjectArgs(args);
+  if (!canonical.ok) return createErrorResponse(canonical.message, []);
+  const resolution = pool.resolve(toolName, canonical.key);
+  if (resolution.kind === 'refusal') {
+    const [first = '', ...rest] = resolution.message.split('\n');
+    return createErrorResponse(first, rest);
+  }
+  const { runner, key } = resolution;
+  const callCtx: McpContext = { ...ctx, sessions: pool, serverConfig: pool.serverConfig };
+
+  const invoke = async (): Promise<ToolResponse> => {
+    pool.begin(key, toolName);
+    try {
+      const result = await handler(runner, canonical.args, callCtx);
+      return isOk(result) ? result.value : result.error;
+    } finally {
+      pool.end(key);
+    }
+  };
+
+  if (key === null || !pool.isLifecycleTool(toolName)) return invoke();
+
+  return pool.withLifecycle(key, async () => {
+    if (toolName !== 'run_project') {
+      const response = await invoke();
+      if (!response.isError && (toolName === 'stop_project' || toolName === 'detach_project')) {
+        pool.noteStopped(key);
+      }
+      return response;
+    }
+    const refusal = pool.admit(key);
+    if (refusal !== null) {
+      const [first = '', ...rest] = refusal.split('\n');
+      return createErrorResponse(first, rest);
+    }
+    let succeeded = false;
+    try {
+      const response = await invoke();
+      succeeded = !response.isError;
+      return response;
+    } finally {
+      await pool.settleLaunch(key, succeeded);
+    }
+  });
 }

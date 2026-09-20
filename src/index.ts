@@ -14,7 +14,11 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { startProgressHeartbeat } from './utils/progress-heartbeat.js';
 
 import type { GodotServerConfig } from './utils/godot-runner.js';
-import { GodotRunner } from './utils/godot-runner.js';
+import { RunnerPool } from './utils/runner-pool.js';
+import { loadServerConfig } from './utils/server-config.js';
+import { existsSync, readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { getErrorMessage } from './utils/error-response.js';
 import { registerProcessLifecycle } from './utils/process-lifecycle.js';
 
@@ -114,11 +118,25 @@ function createContextFromServer(server: Server): McpContext {
 
 class GodotMcpServer {
   private server: Server;
-  private runner: GodotRunner;
+  private pool: RunnerPool;
   private ctx: McpContext;
 
   constructor(config?: GodotServerConfig) {
-    this.runner = new GodotRunner(config);
+    // Settings for many games at once live beside the build, so a client that
+    // names only the entry point (.mcp.json, a codex -c override) gets them too.
+    const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const loaded = loadServerConfig(
+      process.env,
+      (path) => (existsSync(path) ? readFileSync(path, 'utf8') : null),
+      join(packageRoot, 'godot-mcp.config.json'),
+    );
+    for (const problem of loaded.problems) console.error(`[SERVER] Config: ${problem}`);
+    if (loaded.source) console.error(`[SERVER] Config read from ${loaded.source}`);
+    this.pool = new RunnerPool({
+      ...(config ? { runnerConfig: config } : {}),
+      serverConfig: loaded.config,
+      stateDir: process.env.GODOT_MCP_STATE_DIR || join(packageRoot, 'state'),
+    });
 
     this.server = new Server(
       {
@@ -156,12 +174,12 @@ class GodotMcpServer {
 
     this.server.onerror = (error) => console.error('[MCP Error]', error);
 
-    registerProcessLifecycle({ runner: this.runner, cleanup: () => this.cleanup() });
+    registerProcessLifecycle({ runner: this.pool, cleanup: () => this.cleanup() });
   }
 
   private async cleanup() {
     console.error('[SERVER] Cleaning up resources');
-    await this.runner.stopProject();
+    await this.pool.stopAll();
     await this.server.close();
   }
 
@@ -182,7 +200,7 @@ class GodotMcpServer {
       // playtests) instead of failing at the SDK's 60s default.
       const stopHeartbeat = startProgressHeartbeat(extra, request);
       try {
-        return await dispatchToolCall(this.runner, toolName, args, this.ctx);
+        return await dispatchToolCall(this.pool, toolName, args, this.ctx);
       } finally {
         stopHeartbeat();
       }
@@ -191,9 +209,7 @@ class GodotMcpServer {
 
   async run() {
     try {
-      await this.runner.detectGodotPath();
-
-      const godotPath = this.runner.getGodotPath();
+      const godotPath = await this.pool.detectGodotPath();
       if (godotPath) {
         console.error(`[SERVER] Using Godot at: ${godotPath}`);
       }

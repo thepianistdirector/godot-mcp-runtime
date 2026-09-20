@@ -78,6 +78,20 @@ export interface RuntimeStopResult {
 export interface GodotServerConfig {
   godotPath?: string;
   debugMode?: boolean;
+  /**
+   * Where a bridge port comes from when the caller gives none. Defaults to
+   * `findFreePort`. A RunnerPool passes its own allocator so two runners in one
+   * server never hand out the same port inside the bind window.
+   */
+  allocatePort?: () => Promise<number>;
+}
+
+/** Engine options `runProject` adds before the `--` separator. */
+export interface EngineLaunchOptions {
+  /** `--max-fps <n>`; 0 or undefined adds nothing. */
+  maxFps?: number;
+  /** `--audio-driver <name>`; empty or undefined adds nothing. */
+  audioDriver?: string;
 }
 
 export interface OperationResult {
@@ -159,8 +173,10 @@ export class GodotRunner {
   private rxChunks: Buffer[] = [];
   private rxTotal = 0;
   private inFlight: InFlightCommand | null = null;
+  private allocatePort: () => Promise<number>;
 
   constructor(config?: GodotServerConfig) {
+    this.allocatePort = config?.allocatePort ?? findFreePort;
     this.operationsScriptPath = join(__dirname, '..', 'scripts', 'godot_operations.gd');
     const bridgeScriptPath = join(__dirname, '..', 'scripts', 'mcp_bridge.gd');
     this.bridge = new BridgeManager(bridgeScriptPath);
@@ -439,6 +455,7 @@ export class GodotRunner {
     bridgePort?: number,
     profiling: boolean = false,
     userArgs: readonly string[] = [],
+    engine: EngineLaunchOptions = {},
   ): Promise<GodotProcess> {
     if (!this.godotPath) {
       throw new Error(
@@ -477,7 +494,7 @@ export class GodotRunner {
       );
     }
 
-    const port = bridgePort ?? (await findFreePort());
+    const port = bridgePort ?? (await this.allocatePort());
     this.activeBridgePort = port;
 
     try {
@@ -503,6 +520,13 @@ export class GodotRunner {
     if (scene && validateSubPath(projectPath, scene)) {
       logDebug(`Adding scene parameter: ${scene}`);
       cmdArgs.push(scene);
+    }
+    // Engine options stay before the `--`: after it Godot would hand them to the game.
+    if (engine.maxFps !== undefined && engine.maxFps > 0) {
+      cmdArgs.push('--max-fps', String(engine.maxFps));
+    }
+    if (engine.audioDriver) {
+      cmdArgs.push('--audio-driver', engine.audioDriver);
     }
     // The game's own arguments go last, after a standalone `--`. Godot parses nothing after it and
     // hands it all to OS.get_cmdline_user_args(), so a user arg can never act as an engine option
@@ -707,7 +731,7 @@ export class GodotRunner {
       this.activeSessionMode = null;
     }
 
-    const port = bridgePort ?? (await findFreePort());
+    const port = bridgePort ?? (await this.allocatePort());
     this.activeBridgePort = port;
     // Attach has no env channel to a Godot process the user launched
     // themselves, so the baked script copy is the only way to deliver the

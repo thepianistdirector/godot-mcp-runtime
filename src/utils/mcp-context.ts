@@ -46,6 +46,8 @@ export interface SessionState {
   runProjectConfirmed: Set<string>;
 }
 
+import type { ServerConfig } from './server-config.js';
+
 export interface McpContext {
   elicitor: Elicitor;
   strictMode: boolean;
@@ -79,6 +81,20 @@ export interface McpContext {
    */
   disableSecurity: boolean;
   sessionState: SessionState;
+  /**
+   * The server's session pool, when it has one: what `list_sessions` reads and
+   * where `run_project` records a per-session idle-stop opt-out. Absent when a
+   * bare GodotRunner is dispatched (tests, single-session embedding).
+   */
+  sessions?: SessionDirectory;
+  /** Server-wide settings for many games at once; absent means upstream behaviour. */
+  serverConfig?: ServerConfig;
+}
+
+/** The slice of RunnerPool a handler may touch. Kept structural so utils/ has no cycle. */
+export interface SessionDirectory {
+  list(): { sessions: unknown[]; recentlyEnded: unknown[]; limits: unknown };
+  setNoIdleStop(projectKey: string, off: boolean): void;
 }
 
 /**

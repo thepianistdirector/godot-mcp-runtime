@@ -8,7 +8,6 @@
  * server constructor's single call to it is the production registration path.
  */
 
-import type { GodotRunner } from './godot-runner.js';
 import { logError } from './logger.js';
 
 /** Exit code used for every graceful shutdown path below. */
@@ -41,7 +40,8 @@ export interface LifecycleProcess {
  * the byte stream.
  */
 export function registerProcessLifecycle(opts: {
-  runner: GodotRunner;
+  /** A runner or a pool of them: whatever removes bridge artifacts synchronously on exit. */
+  runner: { cleanupBridgeArtifactsSync(): void };
   cleanup: () => Promise<void>;
   proc?: LifecycleProcess;
   exit?: (code: number) => void;

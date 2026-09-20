@@ -1,6 +1,6 @@
 import { join, sep, resolve, relative } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import type { GodotRunner } from '../utils/godot-runner.js';
+import type { EngineLaunchOptions, GodotRunner } from '../utils/godot-runner.js';
 import { BRIDGE_WAIT_SPAWNED_TIMEOUT_MS } from '../utils/bridge-protocol.js';
 import type { HandlerResult, OperationParams, ToolDefinition, ToolResponse } from '../mcp.types.js';
 import { normalizeParameters } from '../utils/parameter-conversion.js';
@@ -84,7 +84,7 @@ export const runtimeToolDefinitions = [
   {
     name: 'run_project',
     description:
-      "Spawn a Godot project as a child process with stdout/stderr captured. Required before take_screenshot, simulate_input, get_ui_elements, run_script, or get_debug_output. Set profiling: true at launch to enable the profiler tools. Pass userArgs for the game's own command-line arguments. Use attach_project for one you launched yourself. Verifies MCP bridge readiness before returning success. Returns status with the assigned bridge port. Call stop_project when done. Errors if projectPath is not a Godot project or another session is already active.",
+      "Spawn a Godot project as a child process with stdout/stderr captured. Required before take_screenshot, simulate_input, get_ui_elements, run_script, or get_debug_output. Set profiling: true at launch to enable the profiler tools. Pass userArgs for the game's own command-line arguments. Use attach_project for one you launched yourself. Verifies MCP bridge readiness before returning success. Returns status with the assigned bridge port. Call stop_project when done. A second run_project for the same projectPath replaces that project's game and no other; other projects' sessions keep running. Errors if projectPath is not a Godot project, if another Godot game the server did not start is already running that project, or if the server's host budget of games is reached.",
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
@@ -114,6 +114,21 @@ export const runtimeToolDefinitions = [
           type: 'boolean',
           description:
             "Attach Godot's own remote debugger so profile_project, start_profiler and stop_profiler can measure this session. Must be set at launch - a session already running cannot be profiled - and costs a little runtime overhead.",
+        },
+        maxFps: {
+          type: 'number',
+          description:
+            'Frame cap for this run: an integer from 0 to 1000, 0 = uncapped. Overrides the server\'s background cap and also applies to a visible run. It does not control audio.',
+        },
+        audio: {
+          type: 'boolean',
+          description:
+            'Keep the real audio driver even on a background run. A server may be configured to give background runs a silent driver so many games do not all reach the speakers; pass audio: true when you have to hear the game (sound review, sound against picture). Default false.',
+        },
+        idleStopMinutes: {
+          type: 'number',
+          description:
+            'Pass 0 to exempt this session from the server\'s idle stop (a long playtest). Omit to use the server setting.',
         },
         userArgs: {
           type: 'array',
@@ -149,13 +164,34 @@ export const runtimeToolDefinitions = [
     },
   },
   {
+    name: 'list_sessions',
+    description:
+      'List the runtime sessions this server holds, one per project path, with the server limits. Use it to see which games are running, which project a refusal was about, why a session ended (stopped, exited, idle, launch_failed), and how close the host is to its budget of games. Takes no arguments and changes nothing. Returns: sessions (projectPath, mode, state launching|live|exited, pid, bridgePort, profiling, startedAt, lastUsedAt, idleSeconds, lastCommand), recentlyEnded (last 20), limits (requireProjectPath, maxGames, gamesOnHost, launching, idleStopMinutes, backgroundMaxFps, backgroundAudioDriver).',
+    annotations: { readOnlyHint: true },
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        sessions: { type: 'array', items: { type: 'object' } },
+        recentlyEnded: { type: 'array', items: { type: 'object' } },
+        limits: { type: 'object' },
+      },
+    },
+  },
+  {
     name: 'detach_project',
     description:
       'Clear attached-mode runtime state and remove the injected McpBridge autoload. Does NOT stop the manually launched Godot process - that stays running. Use after attach_project when you are done driving the game from MCP. For spawned sessions (run_project), use stop_project instead. Mostly optional now: when the bridge disconnects (you closed Godot), the next runtime tool call probes once and ends the attached session itself, removing the autoload. Calling it afterwards still succeeds idempotently, wording the message to distinguish "an attached session existed and already ended" from "this server never attached to a project". Returns: message confirming detach plus externalProcessPreserved (always true here - that is the point of detach vs stop_project). Errors only when a spawned session is what is active; use stop_project for those.',
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
+      },
       required: [],
     },
     outputSchema: {
@@ -174,6 +210,11 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         limit: {
           type: 'number',
           description: 'Max lines to return (default: 200, from end of output)',
@@ -200,7 +241,13 @@ export const runtimeToolDefinitions = [
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
+      },
       required: [],
     },
     outputSchema: {
@@ -224,6 +271,11 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         timeout: {
           type: 'number',
           description: 'Timeout in milliseconds to wait for the screenshot (default: 10000)',
@@ -281,6 +333,11 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         actions: {
           type: 'array',
           description:
@@ -382,6 +439,11 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         visibleOnly: {
           type: 'boolean',
           description:
@@ -436,6 +498,11 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        projectPath: {
+          type: 'string',
+          description:
+            'Absolute path of the project whose session this call acts on: the same value given to run_project or attach_project. Required when the server runs more than one session, and always when the server is configured with requireProjectPath.',
+        },
         script: {
           type: 'string',
           description:
@@ -781,6 +848,23 @@ export async function handleRunProject(
   // asks the user anything. spawn would throw on a NUL byte; refuse it here with a clear message.
   const userArgs = optionalStringArray(args, 'userArgs');
   if (!userArgs.ok) return userArgs;
+  // Refused before the pre-flight scan and the confirmation prompt, like userArgs.
+  const maxFps = optionalNumber(args, 'maxFps');
+  if (!maxFps.ok) return maxFps;
+  if (
+    maxFps.value !== undefined &&
+    (!Number.isInteger(maxFps.value) || maxFps.value < 0 || maxFps.value > 1000)
+  ) {
+    return err(
+      createErrorResponse('Invalid maxFps: an integer from 0 to 1000 is required (0 = uncapped)', [
+        'Omit maxFps to use the server setting',
+      ]),
+    );
+  }
+  const audio = optionalBoolean(args, 'audio');
+  if (!audio.ok) return audio;
+  const idleStop = optionalNumber(args, 'idleStopMinutes');
+  if (!idleStop.ok) return idleStop;
   if (userArgs.value?.some((a) => a.includes('\0'))) {
     return err(
       createErrorResponse('Invalid userArgs: an entry contains a NUL byte', [
@@ -982,6 +1066,22 @@ export async function handleRunProject(
   if (!profiling.ok) return profiling;
   const isProfiling = profiling.value === true;
 
+  // Engine options. A background run takes the server's frame cap and, unless the
+  // caller has to hear the game, its silent audio driver. maxFps never controls audio.
+  const engine: EngineLaunchOptions = {};
+  const cfg = ctx.serverConfig;
+  if (maxFps.value !== undefined) {
+    engine.maxFps = maxFps.value;
+  } else if (isBackground && cfg && cfg.backgroundMaxFps > 0) {
+    engine.maxFps = cfg.backgroundMaxFps;
+  }
+  if (isBackground && audio.value !== true && cfg && cfg.backgroundAudioDriver) {
+    engine.audioDriver = cfg.backgroundAudioDriver;
+  }
+  if (idleStop.value !== undefined && ctx.sessions) {
+    ctx.sessions.setNoIdleStop(projectPath, idleStop.value === 0);
+  }
+
   try {
     await runner.runProject(
       projectPath,
@@ -990,6 +1090,7 @@ export async function handleRunProject(
       bridgePort.value,
       isProfiling,
       userArgs.value ?? [],
+      engine,
     );
 
     const bridgeResult = await runner.waitForBridge();
@@ -1867,4 +1968,20 @@ export async function handleRunScript(
       ]),
     );
   }
+}
+
+export async function handleListSessions(
+  _runner: GodotRunner,
+  _args: OperationParams,
+  ctx: McpContext = createNullContext(),
+): Promise<HandlerResult> {
+  if (!ctx.sessions) {
+    return createStructuredResponse({
+      sessions: [],
+      recentlyEnded: [],
+      limits: null,
+      note: 'This server holds one implicit session and has no session pool.',
+    });
+  }
+  return createStructuredResponse({ ...ctx.sessions.list() });
 }
